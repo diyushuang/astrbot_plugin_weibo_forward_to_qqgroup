@@ -26,7 +26,7 @@ WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_VISITOR_HOST = "https://visitor.passport.weibo.cn"
 WEIBO_GENVISITOR_URL = f"{WEIBO_VISITOR_HOST}/visitor/genvisitor"
 WEIBO_INCARNATE_URL = f"{WEIBO_VISITOR_HOST}/visitor/visitor"
-# 游客系统入口页（genvisitor/incarnate 需要？仅作 Referer）
+# 游客系统入口页（genvisitor/incarnate 的 Referer）
 WEIBO_VISITOR_REFERER = (
     f"{WEIBO_VISITOR_HOST}/visitor/visitor?entry=sinawap&a=enter&url="
     f"{quote(WEIBO_HOME_URL, safe='')}&domain=.weibo.cn&sudaref="
@@ -36,13 +36,16 @@ WEIBO_VISITOR_REFERER = (
 # 出网白名单：微博时间线接口 + 微博游客身份系统
 WEIBO_ALLOWED_HOSTS = {"m.weibo.cn", "visitor.passport.weibo.cn"}
 
-BASE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept-Language": "zh-CN,zh;q=0.9",
-}
+# UA 池：游客身份与 UA 绑定（一套身份一套指纹），全部为移动端 UA。
+# 第一个为实测验证过的 UA。
+UA_POOL = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+)
 API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://m.weibo.cn/",
@@ -53,8 +56,13 @@ API_HEADERS = {
 SEEN_IDS_LIMIT = 500
 PENDING_HARD_LIMIT = 100
 MIN_INTERVAL_SECONDS = 30
-VISITOR_MAX_AGE = 3 * 24 * 3600  # 游客身份最长复用 3 天，过期主动换新
-RENEW_COOLDOWN = 60.0
+VISITOR_MAX_AGE = 3 * 24 * 3600   # 游客身份最长复用 3 天，到期主动换新
+RENEW_COOLDOWN = 600.0            # 主动续期最小间隔（秒）：频繁 genvisitor 本身是风控信号
+RENEW_MAX_PER_HOUR = 3            # 每小时最多续期尝试次数
+RENEW_FAIL_BACKOFF = 600.0        # 续期失败退避基数（秒），指数递增，封顶 1 小时
+REQUEST_GAP = (2.0, 5.0)          # 相邻两次微博请求的最小随机间隔（秒）
+# HTTP 418/432 属于 IP 级风控：全局冷却梯度（秒），触发后暂停所有微博请求
+RISK_COOLDOWN_STEPS = (600, 1800, 3600)
 
 _MONTH_MAP = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
@@ -89,6 +97,10 @@ class WeiboFetchError(Exception):
 
 class WeiboAuthError(WeiboFetchError):
     """游客身份失效，需要重新换取后再试。"""
+
+
+class WeiboRiskError(WeiboFetchError):
+    """触发微博 IP 级风控（HTTP 418/432），需要全局冷却。"""
 
 
 def _clean_text(raw: str, limit: int) -> str:
@@ -160,10 +172,21 @@ class WeiboMonitorPlugin(Star):
         self._poll_task: asyncio.Task | None = None
         self._checking = False
         self._data_dir: Path | None = None
-        # 游客身份 cookie（仅 .weibo.cn 匿名游客，非用户账号）
+        # 游客身份 cookie（仅 .weibo.cn 匿名游客，非用户账号）；UA 与身份绑定
         self._visitor_cookies: dict[str, str] = {}
         self._visitor_ts = 0.0
+        self._ua: str = ""
+        # 续期节奏控制
         self._last_renew_ts = 0.0
+        self._renew_times: list[float] = []
+        self._renew_fail_count = 0
+        self._renew_fail_until = 0.0
+        # IP 级风控全局冷却
+        self._blocked_until = 0.0
+        self._risk_level = 0
+        # 全局请求间隔
+        self._last_request_mono = 0.0
+        self._proxy: str | None = None
         # uid -> {"name", "seen_ids"(list), "baseline_done"}
         self.accounts: dict[str, dict[str, Any]] = {}
         # 待推送队列: [{"post_id","uid","text","retries"}]
@@ -178,7 +201,21 @@ class WeiboMonitorPlugin(Star):
         self._sync_accounts_from_config()
         # DummyCookieJar：cookie 全部手工管理，避免与 jar 自动附带冲突
         self._http = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar())
-        if self._visitor_cookies and time.time() - self._visitor_ts > VISITOR_MAX_AGE:
+        proxy = str(self.config.get("proxy") or "").strip()
+        if proxy:
+            if proxy.startswith(("http://", "https://")):
+                self._proxy = proxy
+                logger.info(f"{PLUGIN_NAME} 使用代理出网: {proxy}")
+            else:
+                logger.warning(
+                    f"{PLUGIN_NAME} proxy 配置无效（需 http:// 或 https:// 开头），已忽略: {proxy}"
+                )
+        # 启动预热：身份过期则换新；身份健在则访问一次主页刷新 _T_WM/XSRF 指纹
+        if self._visitor_cookies.get("SUB") and (
+            time.time() - self._visitor_ts <= VISITOR_MAX_AGE
+        ):
+            await self._warmup_quietly()
+        else:
             await self._renew_visitor_quietly()
         self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info(
@@ -259,6 +296,8 @@ class WeiboMonitorPlugin(Star):
         if isinstance(cookies, dict) and cookies.get("SUB"):
             self._visitor_cookies = {str(k): str(v) for k, v in cookies.items()}
             self._visitor_ts = float(visitor.get("ts") or 0)
+            ua = str(visitor.get("ua") or "")
+            self._ua = ua if ua in UA_POOL else ""
 
     def _save_state(self):
         if self._data_dir is None:
@@ -278,6 +317,7 @@ class WeiboMonitorPlugin(Star):
             "visitor": {
                 "cookies": self._visitor_cookies,
                 "ts": self._visitor_ts,
+                "ua": self._ua,
             },
         }
         try:
@@ -314,24 +354,42 @@ class WeiboMonitorPlugin(Star):
             ):
                 raise WeiboFetchError(f"域名解析到受限地址，已拦截: {ip}")
 
+    async def _pace(self):
+        """全局请求间隔：任意两次微博请求之间至少间隔 REQUEST_GAP 内的随机秒数。"""
+        gap = random.uniform(*REQUEST_GAP)
+        wait = self._last_request_mono + gap - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_request_mono = time.monotonic()
+
+    def _base_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": self._ua or UA_POOL[0],
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+
     async def _get_text(self, url: str, params: dict[str, Any],
                         headers: dict[str, str],
                         collect: dict[str, str] | None = None) -> str:
         await self._validate_url(url)
+        await self._pace()
         assert self._http is not None
         timeout = aiohttp.ClientTimeout(total=15)
         last_err: Exception | None = None
         for attempt in range(3):
             try:
                 async with self._http.get(
-                    url, params=params, headers=headers, timeout=timeout
+                    url, params=params, headers=headers, timeout=timeout,
+                    proxy=self._proxy,
                 ) as resp:
                     if resp.status in (418, 432):
-                        raise WeiboAuthError(f"HTTP {resp.status}，疑似触发微博风控")
+                        raise WeiboRiskError(f"HTTP {resp.status}，触发微博 IP 级风控")
                     resp.raise_for_status()
                     if collect is not None:
                         self._merge_cookies(collect, resp)
                     return await resp.text()
+            except (WeiboRiskError, WeiboAuthError):
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_err = e
                 await asyncio.sleep(1.5 * (2**attempt))
@@ -339,15 +397,28 @@ class WeiboMonitorPlugin(Star):
 
     async def _api_get(self, params: dict[str, Any],
                        referer: str | None = None) -> dict[str, Any]:
-        """GET m.weibo.cn 接口。游客身份失效时自动换新并重试一次。"""
+        """GET m.weibo.cn 接口。
+
+        ok=-100（游客身份过期）→ 换新身份重试一次；
+        HTTP 418/432（IP 级风控）→ 记录全局冷却并换新身份，重试一次。
+        """
         for attempt in (1, 2):
             try:
-                return await self._api_get_once(params, referer)
+                data = await self._api_get_once(params, referer)
+                # 成功即解除风控冷却
+                self._risk_level = 0
+                self._blocked_until = 0.0
+                return data
+            except WeiboRiskError as e:
+                self._mark_risk_blocked(e)
+                if attempt == 2:
+                    raise
+                await self._renew_quietly_force()
             except WeiboAuthError as e:
                 if attempt == 2:
                     raise
                 logger.info(f"游客身份失效（{e}），正在自动换新…")
-                await self._renew_visitor()
+                await self._renew_visitor(force=True)
         raise WeiboFetchError("unreachable")  # pragma: no cover
 
     async def _api_get_once(self, params: dict[str, Any],
@@ -356,7 +427,7 @@ class WeiboMonitorPlugin(Star):
             raise WeiboFetchError("HTTP 会话未初始化")
         if not self._visitor_cookies.get("SUB"):
             await self._renew_visitor()
-        headers = dict(BASE_HEADERS)
+        headers = self._base_headers()
         headers.update(API_HEADERS)
         headers["Referer"] = referer or "https://m.weibo.cn/"
         headers["Cookie"] = "; ".join(
@@ -378,19 +449,95 @@ class WeiboMonitorPlugin(Star):
             raise WeiboFetchError(f"接口返回异常 ok={data.get('ok')}")
         return data
 
-    async def _renew_visitor(self):
-        """向微博游客系统换取新的匿名游客身份（SUB/SUBP，种在 .weibo.cn 域）。"""
+    def _mark_risk_blocked(self, e: Exception):
+        """IP 级风控：全局冷却并按连续触发次数升级（10 → 30 → 60 分钟）。"""
+        level = self._risk_level
+        cooldown = RISK_COOLDOWN_STEPS[min(level, len(RISK_COOLDOWN_STEPS) - 1)]
+        self._risk_level = min(level + 1, len(RISK_COOLDOWN_STEPS) - 1)
+        self._blocked_until = time.time() + cooldown
+        logger.warning(
+            f"{PLUGIN_NAME} 触发微博风控，全局冷却 {cooldown // 60} 分钟"
+            f"（连续第 {level + 1} 次触发）: {e}"
+        )
+
+    async def _renew_quietly_force(self):
+        try:
+            await self._renew_visitor(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"{PLUGIN_NAME} 换新游客身份失败: {e}")
+
+    async def _renew_visitor_quietly(self):
+        try:
+            await self._renew_visitor()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"{PLUGIN_NAME} 更新游客身份失败: {e}")
+
+    async def _warmup_quietly(self):
+        """启动预热：带现有身份访问一次主页，刷新 _T_WM/XSRF-TOKEN 等指纹 cookie。"""
+        try:
+            cookies: dict[str, str] = {}
+            await self._get_text(WEIBO_HOME_URL, {}, self._base_headers(),
+                                 collect=cookies)
+            if cookies:
+                self._visitor_cookies.update(cookies)
+                self._save_state()
+                logger.info(f"{PLUGIN_NAME} 启动预热完成（{sorted(cookies)}）")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.info(f"{PLUGIN_NAME} 启动预热失败（不影响运行）: {e}")
+
+    async def _renew_visitor(self, force: bool = False):
+        """向微博游客系统换取新的匿名游客身份（SUB/SUBP，种在 .weibo.cn 域）。
+
+        节流策略：每小时最多 RENEW_MAX_PER_HOUR 次尝试；
+        失败后指数退避；非强制模式下受 RENEW_COOLDOWN 冷却限制。
+        """
         if self._http is None:
             raise WeiboFetchError("HTTP 会话未初始化")
         now = time.time()
-        if now - self._last_renew_ts < RENEW_COOLDOWN and self._visitor_cookies:
-            # 冷却期内直接复用现有身份（避免风暴式重试）
-            return
+        recent = [t for t in self._renew_times if now - t < 3600.0]
+        self._renew_times = recent
+        if len(recent) >= RENEW_MAX_PER_HOUR:
+            raise WeiboFetchError(
+                f"游客身份续期已达每小时上限（{RENEW_MAX_PER_HOUR} 次），稍后自动重试"
+            )
+        if now < self._renew_fail_until:
+            raise WeiboFetchError(
+                "上次续期失败，退避中："
+                f"{datetime.fromtimestamp(self._renew_fail_until).strftime('%H:%M:%S')} 后自动重试"
+            )
+        if (
+            not force
+            and self._visitor_cookies.get("SUB")
+            and now - self._last_renew_ts < RENEW_COOLDOWN
+        ):
+            return  # 冷却期内且现有身份尚在，直接复用
+        self._renew_times.append(now)
         self._last_renew_ts = now
-        logger.info(f"{PLUGIN_NAME} 正在获取微博游客身份…")
+        try:
+            await self._do_renew()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._renew_fail_count += 1
+            backoff = min(3600.0, RENEW_FAIL_BACKOFF * (2 ** (self._renew_fail_count - 1)))
+            self._renew_fail_until = time.time() + backoff
+            raise
+        self._renew_fail_count = 0
+        self._renew_fail_until = 0.0
+        self._save_state()
 
+    async def _do_renew(self):
+        assert self._http is not None
+        logger.info(f"{PLUGIN_NAME} 正在获取微博游客身份…")
+        self._ua = random.choice(UA_POOL)
         cookies: dict[str, str] = {}
-        common = dict(BASE_HEADERS)
+        common = self._base_headers()
         visitor_headers = dict(common)
         visitor_headers["Referer"] = WEIBO_VISITOR_REFERER
 
@@ -440,20 +587,11 @@ class WeiboMonitorPlugin(Star):
         cookies.setdefault("MLOGIN", "0")
         self._visitor_cookies = cookies
         self._visitor_ts = time.time()
-        self._save_state()
         logger.info(f"{PLUGIN_NAME} 游客身份已更新（{sorted(cookies)}）")
-
-    async def _renew_visitor_quietly(self):
-        try:
-            await self._renew_visitor()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"{PLUGIN_NAME} 更新游客身份失败: {e!r}")
 
     @staticmethod
     def _merge_cookies(target: dict[str, str], resp: aiohttp.ClientResponse):
-        """把响应 Set-Cookie 合入字典（仅保留 weibo.cn 相关域）。"""
+        """把响应 Set-Cookie 合入字典（仅保留 weibo 相关域）。"""
         for key, morsel in resp.cookies.items():
             domain = morsel.get("domain") or ""
             if domain and "weibo.cn" not in domain and "weibo.com" not in domain:
@@ -575,11 +713,18 @@ class WeiboMonitorPlugin(Star):
             except Exception as e:
                 logger.error(f"{PLUGIN_NAME} 轮询异常: {e!r}")
             jitter = random.uniform(0, min(15, interval * 0.2))
-            await asyncio.sleep(interval + jitter)
+            if time.time() < self._blocked_until:
+                # 风控冷却期间用短周期轮询，冷却一结束立即恢复检查
+                await asyncio.sleep(min(60, interval))
+            else:
+                await asyncio.sleep(interval + jitter)
 
     async def check_all(self) -> int:
         """检查一轮所有账号并推送，返回本轮新检测到的微博数。"""
         if self._checking:
+            return 0
+        if time.time() < self._blocked_until:
+            logger.info(f"{PLUGIN_NAME} 风控冷却中，本轮跳过")
             return 0
         self._checking = True
         try:
@@ -591,6 +736,9 @@ class WeiboMonitorPlugin(Star):
             new_count = 0
             now = time.time()
             for uid, info in list(self.accounts.items()):
+                if time.time() < self._blocked_until:
+                    logger.warning(f"{PLUGIN_NAME} 风控冷却生效，本轮剩余账号跳过")
+                    break
                 if now < info.get("next_retry_ts", 0):
                     continue
                 try:
@@ -802,6 +950,12 @@ class WeiboMonitorPlugin(Star):
         if not self.accounts:
             yield event.plain_result("尚未监控任何账号，请先用 微博添加 添加")
             return
+        if time.time() < self._blocked_until:
+            remain = int((self._blocked_until - time.time()) // 60) + 1
+            yield event.plain_result(
+                f"微博风控冷却中（约 {remain} 分钟后自动恢复），请稍后再试"
+            )
+            return
         yield event.plain_result("正在检查微博更新…")
         new_count = await self.check_all()
         if new_count:
@@ -822,10 +976,15 @@ class WeiboMonitorPlugin(Star):
         lines.append(f"监控账号：{len(self.accounts)} 个")
         lines.append(f"推送目标：{len(self._sessions())} 个")
         lines.append(f"待推送/重试：{len(self.pending)} 条")
-        visitor_age = (
-            f"{(time.time() - self._visitor_ts) / 3600:.1f} 小时前"
-            if self._visitor_ts
-            else "未获取"
-        )
-        lines.append(f"游客身份：{visitor_age}更新")
+        if time.time() < self._blocked_until:
+            remain = int((self._blocked_until - time.time()) // 60) + 1
+            lines.append(f"风控状态：冷却中（约 {remain} 分钟后恢复）")
+        else:
+            lines.append("风控状态：正常")
+        if self._visitor_ts:
+            age = (time.time() - self._visitor_ts) / 3600
+            lines.append(f"游客身份：{age:.1f} 小时前更新")
+        else:
+            lines.append("游客身份：未获取")
+        lines.append(f"出网方式：{'代理 ' + self._proxy if self._proxy else '直连'}")
         yield event.plain_result("\n".join(lines))
