@@ -1,0 +1,45 @@
+{
+  "monitored_uids": {
+    "description": "监控的微博账号 uid 列表（推荐用指令 微博添加 / 微博删除 管理，此处仅作查看与手工调整）",
+    "type": "list",
+    "default": []
+  },
+  "push_sessions": {
+    "description": "推送目标会话列表（unified_msg_origin，通常在群内发送 微博绑定 自动写入，无需手工填写）",
+    "type": "list",
+    "default": []
+  },
+  "poll_interval": {
+    "description": "轮询间隔（秒），最小 30",
+    "type": "int",
+    "default": 120,
+    "hint": "间隔越小越接近实时，但触发微博风控的概率越高"
+  },
+  "include_retweets": {
+    "description": "是否推送博主转发别人的微博",
+    "type": "bool",
+    "default": true
+  },
+  "text_max_length": {
+    "description": "推送正文的摘要最大长度（字符数，超出截断加省略号）",
+    "type": "int",
+    "default": 100
+  },
+  "push_delay_seconds": {
+    "description": "多条推送消息之间的间隔秒数（防刷屏与QQ风控）",
+    "type": "int",
+    "default": 2
+  },
+  "max_pending_retries": {
+    "description": "单条推送失败后的最大重试轮数，超过后放弃",
+    "type": "int",
+    "default": 20
+  },
+  "custom_cookie": {
+    "description": "可选：自定义微博 Cookie（正常情况留空，插件完全免 Cookie 运行）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "仅当个别微博匿名接口拉不到且确需覆盖时才填写，非必需"
+  }
+}

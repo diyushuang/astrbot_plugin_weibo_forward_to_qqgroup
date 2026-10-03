@@ -1,0 +1,831 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import html as html_lib
+import ipaddress
+import json
+import random
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlparse
+
+import aiohttp
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, StarTools
+
+PLUGIN_NAME = "astrbot_plugin_weibo_monitor"
+
+WEIBO_HOME_URL = "https://m.weibo.cn/"
+WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"
+WEIBO_VISITOR_HOST = "https://visitor.passport.weibo.cn"
+WEIBO_GENVISITOR_URL = f"{WEIBO_VISITOR_HOST}/visitor/genvisitor"
+WEIBO_INCARNATE_URL = f"{WEIBO_VISITOR_HOST}/visitor/visitor"
+# 游客系统入口页（genvisitor/incarnate 需要？仅作 Referer）
+WEIBO_VISITOR_REFERER = (
+    f"{WEIBO_VISITOR_HOST}/visitor/visitor?entry=sinawap&a=enter&url="
+    f"{quote(WEIBO_HOME_URL, safe='')}&domain=.weibo.cn&sudaref="
+    "&ua=php-sso_sdk_client-0.6.36&_rand=1791030900.1"
+)
+
+# 出网白名单：微博时间线接口 + 微博游客身份系统
+WEIBO_ALLOWED_HOSTS = {"m.weibo.cn", "visitor.passport.weibo.cn"}
+
+BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
+API_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://m.weibo.cn/",
+    "MWeibo-Pwa": "1",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+SEEN_IDS_LIMIT = 500
+PENDING_HARD_LIMIT = 100
+MIN_INTERVAL_SECONDS = 30
+VISITOR_MAX_AGE = 3 * 24 * 3600  # 游客身份最长复用 3 天，过期主动换新
+RENEW_COOLDOWN = 60.0
+
+_MONTH_MAP = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+_STD_TIME_RE = re.compile(
+    r"^(\w{3}) (\w{3}) (\d{1,2}) (\d{2}):(\d{2}):(\d{2}) \+0800 (\d{4})$"
+)
+_JSONP_RE = re.compile(r"\((\{.*\})\)\s*;?\s*$")
+_UID_PATTERNS = (
+    re.compile(r"weibo\.com/u/(\d+)"),
+    re.compile(r"m\.weibo\.cn/u/(\d+)"),
+    re.compile(r"weibo\.cn/u/(\d+)"),
+    re.compile(r"weibo\.com/(\d+)/?"),
+)
+
+USAGE = (
+    "微博监控指令：\n"
+    "微博绑定 - 把当前群绑定为推送目标（管理员）\n"
+    "微博解绑 - 解除当前群推送（管理员）\n"
+    "微博添加 <uid或主页链接> - 添加监控账号（管理员）\n"
+    "微博删除 <uid> - 取消监控（管理员）\n"
+    "微博列表 - 查看监控账号与推送目标\n"
+    "微博检测 - 立即检查一轮（管理员）\n"
+    "微博状态 - 查看运行状态"
+)
+
+
+class WeiboFetchError(Exception):
+    """微博接口请求/解析失败。"""
+
+
+class WeiboAuthError(WeiboFetchError):
+    """游客身份失效，需要重新换取后再试。"""
+
+
+def _clean_text(raw: str, limit: int) -> str:
+    """清洗 m.weibo.cn 返回的 HTML 富文本，截断到 limit。"""
+    if not raw:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
+    # 微博表情等内嵌图片，保留 alt 文本（如 [笑cry]）
+    text = re.sub(r'<img[^>]*alt="([^"]*)"[^>]*>', r"\1", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    if limit > 0 and len(text) > limit:
+        text = text[:limit].rstrip() + "…"
+    return text
+
+
+def _format_time(raw: str) -> str:
+    """把接口时间转成可读字符串；相对时间（如“5分钟前”）原样返回。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    m = _STD_TIME_RE.match(raw)
+    if m and m.group(2) in _MONTH_MAP:
+        year, mon, day = m.group(7), _MONTH_MAP[m.group(2)], int(m.group(3))
+        ymd = f"{year}-{mon:02d}-{day:02d}"
+        if year != str(datetime.now().year):
+            return f"{ymd} {m.group(4)}:{m.group(5)}"
+        return f"{mon:02d}-{day:02d} {m.group(4)}:{m.group(5)}"
+    return raw
+
+
+def _extract_uid(text: str) -> str | None:
+    text = (text or "").strip()
+    for pat in _UID_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return m.group(1)
+    if text.isdigit() and len(text) >= 4:
+        return text
+    return None
+
+
+def _jsonp_data(body: str) -> dict[str, Any] | None:
+    """解析 gen_callback({...}) / cross_domain({...}) 之类的 JSONP 响应。"""
+    m = _JSONP_RE.search((body or "").strip())
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+class WeiboMonitorPlugin(Star):
+    """免 Cookie 监控微博账号更新，并转发到绑定的Q群。
+
+    数据来源为 m.weibo.cn 匿名接口：插件自动向微博游客系统
+    （visitor.passport.weibo.cn）换取匿名游客身份（SUB/SUBP 种在
+    .weibo.cn 域），全程不需要用户提供任何微博 Cookie。
+    """
+
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        self._http: aiohttp.ClientSession | None = None
+        self._poll_task: asyncio.Task | None = None
+        self._checking = False
+        self._data_dir: Path | None = None
+        # 游客身份 cookie（仅 .weibo.cn 匿名游客，非用户账号）
+        self._visitor_cookies: dict[str, str] = {}
+        self._visitor_ts = 0.0
+        self._last_renew_ts = 0.0
+        # uid -> {"name", "seen_ids"(list), "baseline_done"}
+        self.accounts: dict[str, dict[str, Any]] = {}
+        # 待推送队列: [{"post_id","uid","text","retries"}]
+        self.pending: list[dict[str, Any]] = []
+        self.last_check_ts = 0.0
+
+    # ---------------- 生命周期 ----------------
+
+    async def initialize(self):
+        self._data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+        self._load_state()
+        self._sync_accounts_from_config()
+        # DummyCookieJar：cookie 全部手工管理，避免与 jar 自动附带冲突
+        self._http = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar())
+        if self._visitor_cookies and time.time() - self._visitor_ts > VISITOR_MAX_AGE:
+            await self._renew_visitor_quietly()
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        logger.info(
+            f"{PLUGIN_NAME} 已启动：监控 {len(self.accounts)} 个账号，"
+            f"推送目标 {len(self._sessions())} 个"
+        )
+
+    async def terminate(self):
+        if self._poll_task:
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
+            self._poll_task = None
+        self._save_state()
+        if self._http and not self._http.closed:
+            await self._http.close()
+        self._http = None
+        logger.info(f"{PLUGIN_NAME} 已停止")
+
+    # ---------------- 配置与状态 ----------------
+
+    def _sessions(self) -> list[str]:
+        return [str(s) for s in (self.config.get("push_sessions") or [])]
+
+    def _int_cfg(self, key: str, default: int) -> int:
+        try:
+            return max(0, int(self.config.get(key) or default))
+        except (TypeError, ValueError):
+            return default
+
+    def _sync_accounts_from_config(self):
+        """以配置里的 monitored_uids 为准同步监控列表（兼容 WebUI 直接改动）。"""
+        uids: list[str] = []
+        for item in self.config.get("monitored_uids") or []:
+            uid = str(item).strip()
+            if uid.isdigit():
+                uids.append(uid)
+        for uid in dict.fromkeys(uids):  # 去重且保持顺序
+            if uid not in self.accounts:
+                self.accounts[uid] = {
+                    "name": uid,
+                    "seen_ids": [],
+                    "baseline_done": False,
+                    "fail_count": 0,
+                    "next_retry_ts": 0.0,
+                }
+        for uid in [u for u in self.accounts if u not in uids]:
+            self.accounts.pop(uid, None)
+
+    def _state_file(self) -> Path:
+        assert self._data_dir is not None
+        return self._data_dir / "state.json"
+
+    def _load_state(self):
+        try:
+            raw = self._state_file().read_text(encoding="utf-8")
+            state = json.loads(raw)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            logger.warning(f"{PLUGIN_NAME} 读取 state.json 失败，将重建状态: {e}")
+            return
+        for uid, info in (state.get("accounts") or {}).items():
+            if not str(uid).isdigit():
+                continue
+            seen = [str(i) for i in (info.get("seen_ids") or [])][-SEEN_IDS_LIMIT:]
+            self.accounts[str(uid)] = {
+                "name": str(info.get("name") or uid),
+                "seen_ids": seen,
+                "baseline_done": bool(info.get("baseline_done")),
+                "fail_count": 0,
+                "next_retry_ts": 0.0,
+            }
+        self.pending = list(state.get("pending") or [])
+        self.last_check_ts = float(state.get("last_check_ts") or 0)
+        visitor = state.get("visitor") or {}
+        cookies = visitor.get("cookies") or {}
+        if isinstance(cookies, dict) and cookies.get("SUB"):
+            self._visitor_cookies = {str(k): str(v) for k, v in cookies.items()}
+            self._visitor_ts = float(visitor.get("ts") or 0)
+
+    def _save_state(self):
+        if self._data_dir is None:
+            return
+        state = {
+            "version": 1,
+            "accounts": {
+                uid: {
+                    "name": info["name"],
+                    "seen_ids": info["seen_ids"][-SEEN_IDS_LIMIT:],
+                    "baseline_done": info["baseline_done"],
+                }
+                for uid, info in self.accounts.items()
+            },
+            "pending": self.pending,
+            "last_check_ts": self.last_check_ts,
+            "visitor": {
+                "cookies": self._visitor_cookies,
+                "ts": self._visitor_ts,
+            },
+        }
+        try:
+            self._state_file().write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning(f"{PLUGIN_NAME} 保存 state.json 失败: {e}")
+
+    # ---------------- 网络请求 ----------------
+
+    async def _validate_url(self, url: str):
+        """出网前校验：仅 http/https、host 白名单、DNS 不解析到内网/保留地址。"""
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise WeiboFetchError(f"拒绝非 http(s) 协议: {parsed.scheme}")
+        host = parsed.hostname or ""
+        if host not in WEIBO_ALLOWED_HOSTS:
+            raise WeiboFetchError(f"目标 host 不在白名单内: {host}")
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(host, None)
+        except OSError as e:
+            raise WeiboFetchError(f"域名解析失败: {host} ({e})") from e
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_reserved
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                raise WeiboFetchError(f"域名解析到受限地址，已拦截: {ip}")
+
+    async def _get_text(self, url: str, params: dict[str, Any],
+                        headers: dict[str, str],
+                        collect: dict[str, str] | None = None) -> str:
+        await self._validate_url(url)
+        assert self._http is not None
+        timeout = aiohttp.ClientTimeout(total=15)
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with self._http.get(
+                    url, params=params, headers=headers, timeout=timeout
+                ) as resp:
+                    if resp.status in (418, 432):
+                        raise WeiboAuthError(f"HTTP {resp.status}，疑似触发微博风控")
+                    resp.raise_for_status()
+                    if collect is not None:
+                        self._merge_cookies(collect, resp)
+                    return await resp.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_err = e
+                await asyncio.sleep(1.5 * (2**attempt))
+        raise WeiboFetchError(f"请求失败: {last_err}")
+
+    async def _api_get(self, params: dict[str, Any],
+                       referer: str | None = None) -> dict[str, Any]:
+        """GET m.weibo.cn 接口。游客身份失效时自动换新并重试一次。"""
+        for attempt in (1, 2):
+            try:
+                return await self._api_get_once(params, referer)
+            except WeiboAuthError as e:
+                if attempt == 2:
+                    raise
+                logger.info(f"游客身份失效（{e}），正在自动换新…")
+                await self._renew_visitor()
+        raise WeiboFetchError("unreachable")  # pragma: no cover
+
+    async def _api_get_once(self, params: dict[str, Any],
+                            referer: str | None) -> dict[str, Any]:
+        if self._http is None:
+            raise WeiboFetchError("HTTP 会话未初始化")
+        if not self._visitor_cookies.get("SUB"):
+            await self._renew_visitor()
+        headers = dict(BASE_HEADERS)
+        headers.update(API_HEADERS)
+        headers["Referer"] = referer or "https://m.weibo.cn/"
+        headers["Cookie"] = "; ".join(
+            f"{k}={v}" for k, v in self._visitor_cookies.items()
+        )
+        xsrf = self._visitor_cookies.get("XSRF-TOKEN", "")
+        if xsrf:
+            headers["X-Xsrf-Token"] = xsrf
+        body = await self._get_text(WEIBO_INDEX_URL, params, headers)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise WeiboFetchError("接口返回的不是 JSON") from e
+        if not isinstance(data, dict):
+            raise WeiboFetchError("接口返回异常")
+        if data.get("ok") == -100:
+            raise WeiboAuthError("接口要求登录（ok=-100）")
+        if data.get("ok") != 1:
+            raise WeiboFetchError(f"接口返回异常 ok={data.get('ok')}")
+        return data
+
+    async def _renew_visitor(self):
+        """向微博游客系统换取新的匿名游客身份（SUB/SUBP，种在 .weibo.cn 域）。"""
+        if self._http is None:
+            raise WeiboFetchError("HTTP 会话未初始化")
+        now = time.time()
+        if now - self._last_renew_ts < RENEW_COOLDOWN and self._visitor_cookies:
+            # 冷却期内直接复用现有身份（避免风暴式重试）
+            return
+        self._last_renew_ts = now
+        logger.info(f"{PLUGIN_NAME} 正在获取微博游客身份…")
+
+        cookies: dict[str, str] = {}
+        common = dict(BASE_HEADERS)
+        visitor_headers = dict(common)
+        visitor_headers["Referer"] = WEIBO_VISITOR_REFERER
+
+        # 1) 预热移动端主页，收集 _T_WM / XSRF-TOKEN / MLOGIN 等游客 cookie
+        await self._get_text(WEIBO_HOME_URL, {}, common, collect=cookies)
+
+        # 2) genvisitor 获取 tid
+        fp = json.dumps(
+            {
+                "os": "1",
+                "browser": "Chrome136,136,0,0",
+                "fonts": "undefined",
+                "screenInfo": "1920*1080*30",
+                "plugins": "",
+            },
+            separators=(",", ":"),
+        )
+        body = await self._get_text(
+            WEIBO_GENVISITOR_URL,
+            {"cb": "gen_callback", "fp": quote(fp, safe="")},
+            visitor_headers,
+        )
+        gen = _jsonp_data(body) or {}
+        if gen.get("retcode") != 20000000:
+            raise WeiboFetchError(f"genvisitor 失败: {gen.get('retcode')} {gen.get('msg')}")
+        tid = str((gen.get("data") or {}).get("tid") or "")
+        confidence = (gen.get("data") or {}).get("confidence", 90)
+        if not tid:
+            raise WeiboFetchError("genvisitor 未返回 tid")
+
+        # 3) incarnate 换取游客 SUB/SUBP（响应 Set-Cookie 种在 .weibo.cn 域）
+        inc_params = {
+            "a": "incarnate",
+            "t": tid,
+            "w": "2",
+            "c": str(confidence),
+            "gc": "",
+            "cb": "cross_domain",
+            "from": "weibo",
+            "_rand": f"{random.random():.17f}",
+        }
+        await self._get_text(WEIBO_INCARNATE_URL, inc_params, visitor_headers,
+                             collect=cookies)
+
+        if "SUB" not in cookies:
+            raise WeiboAuthError("游客身份获取失败（未拿到 SUB）")
+        cookies.setdefault("MLOGIN", "0")
+        self._visitor_cookies = cookies
+        self._visitor_ts = time.time()
+        self._save_state()
+        logger.info(f"{PLUGIN_NAME} 游客身份已更新（{sorted(cookies)}）")
+
+    async def _renew_visitor_quietly(self):
+        try:
+            await self._renew_visitor()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"{PLUGIN_NAME} 更新游客身份失败: {e!r}")
+
+    @staticmethod
+    def _merge_cookies(target: dict[str, str], resp: aiohttp.ClientResponse):
+        """把响应 Set-Cookie 合入字典（仅保留 weibo.cn 相关域）。"""
+        for key, morsel in resp.cookies.items():
+            domain = morsel.get("domain") or ""
+            if domain and "weibo.cn" not in domain and "weibo.com" not in domain:
+                continue
+            target[str(key)] = str(morsel.value)
+
+    # ---------------- 数据获取与解析 ----------------
+
+    async def _fetch_timeline(self, uid: str) -> list[dict[str, Any]]:
+        """拉取用户最新一页微博，返回解析后的帖子列表（新→旧）。"""
+        data = await self._api_get(
+            {
+                "type": "uid",
+                "value": uid,
+                "containerid": f"107603{uid}",
+                "page": 1,
+                "count": 20,
+            },
+            referer=f"https://m.weibo.cn/u/{uid}",
+        )
+        cards = (data.get("data") or {}).get("cards") or []
+        posts: list[dict[str, Any]] = []
+        for card in cards:
+            if card.get("card_type") != 9:
+                continue
+            mb = card.get("mblog") or {}
+            if self._is_pinned(card, mb):
+                continue
+            post = self._parse_post(mb, uid)
+            if post:
+                posts.append(post)
+        return posts
+
+    async def _fetch_nickname(self, uid: str) -> str | None:
+        """通过用户资料容器拉取昵称，失败返回 None。"""
+        try:
+            data = await self._api_get(
+                {"type": "uid", "value": uid, "containerid": f"100505{uid}"},
+                referer=f"https://m.weibo.cn/u/{uid}",
+            )
+            info = (data.get("data") or {}).get("userInfo") or {}
+            name = str(info.get("screen_name") or "").strip()
+            if name:
+                return name
+        except WeiboFetchError as e:
+            logger.info(f"拉取用户 {uid} 昵称失败（不影响添加）: {e}")
+        return None
+
+    @staticmethod
+    def _is_pinned(card: dict[str, Any], mb: dict[str, Any]) -> bool:
+        for node in (card, mb):
+            with contextlib.suppress(TypeError, ValueError):
+                if int(node.get("mblogtype") or 0) == 2:
+                    return True
+            if node.get("isTop") or node.get("is_top"):
+                return True
+        title = mb.get("title")
+        if isinstance(title, dict) and title.get("text") == "置顶":
+            return True
+        return False
+
+    def _parse_post(self, mb: dict[str, Any], fallback_uid: str) -> dict[str, Any] | None:
+        pid = str(mb.get("id") or mb.get("mid") or "").strip()
+        if not pid:
+            return None
+        user = mb.get("user") or {}
+        uid = str(user.get("id") or fallback_uid)
+        bid = str(mb.get("bid") or pid)
+        limit = self._int_cfg("text_max_length", 100)
+
+        own_text = _clean_text(str(mb.get("text") or ""), limit)
+        orig_name, orig_text = "", ""
+        is_retweet = "retweeted_status" in mb
+        if is_retweet:
+            rt = mb.get("retweeted_status") or {}
+            rt_user = rt.get("user") or {}
+            orig_name = str(rt_user.get("screen_name") or "")
+            orig_text = _clean_text(str(rt.get("text") or ""), limit)
+
+        return {
+            "id": pid,
+            "uid": uid,
+            "author": str(user.get("screen_name") or "") or uid,
+            "link": f"https://weibo.com/{uid}/{bid}",
+            "time": _format_time(str(mb.get("created_at") or "")),
+            "text": own_text,
+            "is_retweet": is_retweet,
+            "orig_name": orig_name,
+            "orig_text": orig_text,
+        }
+
+    def _build_message(self, post: dict[str, Any]) -> str:
+        name = self.accounts.get(post["uid"], {}).get("name") or post["author"]
+        lines = ["📢 微博更新", f"【{name}】{post['time']}"]
+        if post["is_retweet"]:
+            if post["text"]:
+                lines.append(post["text"])
+            who = post["orig_name"] or "原作者"
+            body = f"转发 @{who}：{post['orig_text'] or '（原微博内容不可见）'}"
+            lines.append(body)
+        elif post["text"]:
+            lines.append(post["text"])
+        lines.append(f"🔗 {post['link']}")
+        return "\n".join(line for line in lines if line)
+
+    # ---------------- 轮询与推送 ----------------
+
+    async def _poll_loop(self):
+        logger.info(f"{PLUGIN_NAME} 轮询任务已启动")
+        await asyncio.sleep(5)
+        while True:
+            interval = max(MIN_INTERVAL_SECONDS, self._int_cfg("poll_interval", 120))
+            try:
+                pushed = await self.check_all()
+                if pushed:
+                    logger.info(f"本轮共推送 {pushed} 条新微博")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"{PLUGIN_NAME} 轮询异常: {e!r}")
+            jitter = random.uniform(0, min(15, interval * 0.2))
+            await asyncio.sleep(interval + jitter)
+
+    async def check_all(self) -> int:
+        """检查一轮所有账号并推送，返回本轮新检测到的微博数。"""
+        if self._checking:
+            return 0
+        self._checking = True
+        try:
+            self._sync_accounts_from_config()
+            if not self._visitor_cookies.get("SUB") or (
+                time.time() - self._visitor_ts > VISITOR_MAX_AGE
+            ):
+                await self._renew_visitor_quietly()
+            new_count = 0
+            now = time.time()
+            for uid, info in list(self.accounts.items()):
+                if now < info.get("next_retry_ts", 0):
+                    continue
+                try:
+                    new_count += await self._check_account(uid)
+                    info["fail_count"] = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    info["fail_count"] = info.get("fail_count", 0) + 1
+                    fail = info["fail_count"]
+                    backoff = min(600.0, 60.0 * 2 ** (fail - 1)) if fail >= 2 else 60.0
+                    info["next_retry_ts"] = time.time() + backoff
+                    logger.warning(
+                        f"检查账号 {uid} 失败（连续第 {fail} 次，{backoff:.0f}s 后重试）: {e}"
+                    )
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+            await self._flush_pending()
+            self.last_check_ts = time.time()
+            self._save_state()
+            return new_count
+        finally:
+            self._checking = False
+
+    async def _check_account(self, uid: str) -> int:
+        info = self.accounts[uid]
+        posts = await self._fetch_timeline(uid)
+        # 用接口数据修正昵称（添加时可能没拉到）
+        if posts and info.get("name") == uid:
+            info["name"] = posts[0]["author"]
+        seen: set[str] = set(info.get("seen_ids") or [])
+        if not info.get("baseline_done"):
+            # 首次观察：只记录基线，不推送历史微博
+            for post in posts:
+                seen.add(post["id"])
+            info["seen_ids"] = list(seen)[-SEEN_IDS_LIMIT:]
+            info["baseline_done"] = True
+            logger.info(f"账号 {uid} 基线已建立，共 {len(posts)} 条历史微博")
+            return 0
+        new_posts = [p for p in posts if p["id"] not in seen]
+        if not new_posts:
+            return 0
+        include_rt = bool(self.config.get("include_retweets", True))
+        for post in reversed(new_posts):  # 旧→新依次入队
+            seen.add(post["id"])
+            if post["is_retweet"] and not include_rt:
+                continue
+            if len(self.pending) >= PENDING_HARD_LIMIT:
+                logger.warning("待推送队列已满，丢弃更早的新微博")
+                continue
+            self.pending.append(
+                {
+                    "post_id": post["id"],
+                    "uid": post["uid"],
+                    "text": self._build_message(post),
+                    "retries": 0,
+                }
+            )
+        info["seen_ids"] = list(seen)[-SEEN_IDS_LIMIT:]
+        return len(new_posts)
+
+    async def _flush_pending(self):
+        """把待推送队列发送到所有绑定的会话。"""
+        max_retries = self._int_cfg("max_pending_retries", 20)
+        delay = self._int_cfg("push_delay_seconds", 2)
+        sessions = self._sessions()
+        remaining: list[dict[str, Any]] = []
+        for item in self.pending:
+            if not sessions:
+                # 未绑定推送目标：保留消息但不消耗重试次数
+                remaining.append(item)
+                continue
+            if item["retries"] >= max_retries:
+                logger.warning(f"推送重试超限，放弃微博 {item['post_id']}")
+                continue
+            sent = False
+            for session in sessions:
+                try:
+                    ok = await self.context.send_message(
+                        session, MessageChain().message(item["text"])
+                    )
+                    sent = sent or bool(ok)
+                except Exception as e:
+                    logger.warning(f"推送到 {session} 异常: {e!r}")
+            if sent:
+                logger.info(f"已推送微博 {item['post_id']}")
+            else:
+                item["retries"] += 1
+                remaining.append(item)
+            if delay:
+                await asyncio.sleep(delay)
+        if not sessions and len(remaining) > PENDING_HARD_LIMIT:
+            remaining = remaining[-PENDING_HARD_LIMIT:]
+        self.pending = remaining
+
+    # ---------------- 指令 ----------------
+
+    @filter.command_group("微博")
+    async def weibo(self, event: AstrMessageEvent):
+        """微博监控转发指令组"""
+        yield event.plain_result(USAGE)
+
+    @weibo.command("帮助", alias={"help", "用法"})
+    async def weibo_help(self, event: AstrMessageEvent):
+        """查看微博监控指令用法"""
+        yield event.plain_result(USAGE)
+
+    @weibo.command("绑定")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_bind(self, event: AstrMessageEvent):
+        """把当前群聊绑定为微博推送目标（管理员）"""
+        if not event.get_group_id():
+            yield event.plain_result("请在要接收推送的群聊中使用该指令")
+            return
+        umo = event.unified_msg_origin
+        sessions = self._sessions()
+        if umo in sessions:
+            yield event.plain_result("本群已在推送列表中，无需重复绑定")
+            return
+        sessions.append(umo)
+        self.config["push_sessions"] = sessions
+        self.config.save_config()
+        logger.info(f"{PLUGIN_NAME} 新增推送目标: {umo}")
+        yield event.plain_result("绑定成功，本群将接收微博更新推送")
+
+    @weibo.command("解绑")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_unbind(self, event: AstrMessageEvent):
+        """解除当前群聊的微博推送（管理员）"""
+        umo = event.unified_msg_origin
+        sessions = self._sessions()
+        if umo not in sessions:
+            yield event.plain_result("本群尚未绑定推送")
+            return
+        sessions.remove(umo)
+        self.config["push_sessions"] = sessions
+        self.config.save_config()
+        logger.info(f"{PLUGIN_NAME} 移除推送目标: {umo}")
+        yield event.plain_result("解绑成功，本群不再接收推送")
+
+    @weibo.command("添加")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_add(self, event: AstrMessageEvent, uid_text: str = ""):
+        """添加监控的微博账号，参数为 uid 或主页链接（管理员）"""
+        uid = _extract_uid(uid_text)
+        if not uid:
+            yield event.plain_result(
+                "用法：微博添加 <uid或主页链接>\n"
+                "例如：微博添加 1195230310 或 微博添加 https://weibo.com/u/1195230310"
+            )
+            return
+        self._sync_accounts_from_config()
+        if uid in self.accounts:
+            yield event.plain_result(f"账号 {uid} 已在监控列表中")
+            return
+        yield event.plain_result("正在验证账号…")
+        nickname = await self._fetch_nickname(uid)
+        self.accounts[uid] = {
+            "name": nickname or uid,
+            "seen_ids": [],
+            "baseline_done": False,
+            "fail_count": 0,
+            "next_retry_ts": 0.0,
+        }
+        self.config["monitored_uids"] = list(self.accounts.keys())
+        self.config.save_config()
+        self._save_state()
+        name = self.accounts[uid]["name"]
+        extra = "" if nickname else "（未能获取昵称，下轮检查会自动补齐，请留意确认 uid 正确）"
+        yield event.plain_result(
+            f"已添加监控：{name}（{uid}）{extra}\n"
+            "下一轮检查将建立基线，历史微博不会推送，仅推送之后的新微博。"
+        )
+
+    @weibo.command("删除")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_remove(self, event: AstrMessageEvent, uid_text: str = ""):
+        """取消监控某个微博账号（管理员）"""
+        uid = _extract_uid(uid_text)
+        self._sync_accounts_from_config()
+        if not uid or uid not in self.accounts:
+            yield event.plain_result(
+                f"账号 {uid or '(空)'} 不在监控列表中，请用 微博列表 查看"
+            )
+            return
+        name = self.accounts.pop(uid)["name"]
+        self.config["monitored_uids"] = list(self.accounts.keys())
+        self.config.save_config()
+        self._save_state()
+        yield event.plain_result(f"已取消监控：{name}（{uid}）")
+
+    @weibo.command("列表")
+    async def weibo_list(self, event: AstrMessageEvent):
+        """查看当前监控的微博账号"""
+        self._sync_accounts_from_config()
+        if not self.accounts:
+            yield event.plain_result("尚未监控任何账号，管理员可用 微博添加 <uid> 添加")
+            return
+        lines = ["当前监控的微博账号："]
+        for idx, (uid, info) in enumerate(self.accounts.items(), 1):
+            lines.append(f"{idx}. {info['name']}（{uid}）")
+        sessions = self._sessions()
+        lines.append(f"推送目标：{len(sessions)} 个（群内发送 微博绑定 添加）")
+        yield event.plain_result("\n".join(lines))
+
+    @weibo.command("检测")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_check(self, event: AstrMessageEvent):
+        """立即检查一轮微博更新（管理员）"""
+        if not self.accounts:
+            yield event.plain_result("尚未监控任何账号，请先用 微博添加 添加")
+            return
+        yield event.plain_result("正在检查微博更新…")
+        new_count = await self.check_all()
+        if new_count:
+            yield event.plain_result(f"检查完成，本轮新增 {new_count} 条微博")
+        else:
+            yield event.plain_result("检查完成，暂无新微博")
+
+    @weibo.command("状态")
+    async def weibo_status(self, event: AstrMessageEvent):
+        """查看插件运行状态"""
+        lines = ["微博监控运行状态："]
+        last = (
+            datetime.fromtimestamp(self.last_check_ts).strftime("%Y-%m-%d %H:%M:%S")
+            if self.last_check_ts
+            else "尚未检查"
+        )
+        lines.append(f"上次检查：{last}")
+        lines.append(f"监控账号：{len(self.accounts)} 个")
+        lines.append(f"推送目标：{len(self._sessions())} 个")
+        lines.append(f"待推送/重试：{len(self.pending)} 条")
+        visitor_age = (
+            f"{(time.time() - self._visitor_ts) / 3600:.1f} 小时前"
+            if self._visitor_ts
+            else "未获取"
+        )
+        lines.append(f"游客身份：{visitor_age}更新")
+        yield event.plain_result("\n".join(lines))

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 打包产物（发布时用 GitHub Release 或手动分发）
+*.zip
+
+# 本地工具与临时数据
+.mimosa/
+.zcode/
+.playwright-mcp/
+_test_data/
+.playwright-mcp/
