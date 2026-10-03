@@ -69,9 +69,15 @@
 | `push_sessions` | `[]` | 推送目标会话（用 `微博绑定` 管理） |
 | `poll_interval` | `120` | 轮询间隔（秒），最小 30 |
 | `include_retweets` | `true` | 是否推送转发的微博 |
+| `message_format` | 见配置面板 | 消息模板，占位符 `{name}` `{time}` `{weibo}` `{link}`，`\n` 换行 |
 | `text_max_length` | `100` | 摘要最大长度（字符） |
+| `show_full_weibo_text` | `false` | 超长微博额外请求全文，失败回退摘要 |
+| `max_post_age_minutes` | `0` | 不推送超过此时长的微博（分钟），0 不限制 |
+| `filter_keywords` | `[]` | 屏蔽词：正文命中任一则不推送 |
+| `whitelist_keywords` | `[]` | 白名单：非空时正文须命中任一关键词才推送 |
 | `push_delay_seconds` | `2` | 多条推送之间的间隔（秒） |
 | `max_pending_retries` | `20` | 推送失败最大重试轮数 |
+| `message_send_timeout` | `60` | 单条消息发送超时（秒），0 不限制 |
 | `custom_cookie` | 空 | 可选兜底 Cookie，正常情况留空 |
 | `proxy` | 空 | 可选 HTTP(S) 代理，海外/VPS 部署建议配置国内出口代理 |
 

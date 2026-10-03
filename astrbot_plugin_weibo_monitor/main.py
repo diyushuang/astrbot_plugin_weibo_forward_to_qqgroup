@@ -8,7 +8,7 @@ import json
 import random
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -23,6 +23,7 @@ PLUGIN_NAME = "astrbot_plugin_weibo_monitor"
 
 WEIBO_HOME_URL = "https://m.weibo.cn/"
 WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"
+WEIBO_EXTEND_URL = "https://m.weibo.cn/statuses/extend"
 WEIBO_VISITOR_HOST = "https://visitor.passport.weibo.cn"
 WEIBO_GENVISITOR_URL = f"{WEIBO_VISITOR_HOST}/visitor/genvisitor"
 WEIBO_INCARNATE_URL = f"{WEIBO_VISITOR_HOST}/visitor/visitor"
@@ -33,7 +34,7 @@ WEIBO_VISITOR_REFERER = (
     "&ua=php-sso_sdk_client-0.6.36&_rand=1791030900.1"
 )
 
-# 出网白名单：微博时间线接口 + 微博游客身份系统
+# 出网白名单：微博时间线/全文接口 + 微博游客身份系统
 WEIBO_ALLOWED_HOSTS = {"m.weibo.cn", "visitor.passport.weibo.cn"}
 
 # UA 池：游客身份与 UA 绑定（一套身份一套指纹），全部为移动端 UA。
@@ -53,6 +54,8 @@ API_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
+DEFAULT_MESSAGE_FORMAT = "📢 微博更新\n【{name}】{time}\n{weibo}\n🔗 {link}"
+
 SEEN_IDS_LIMIT = 500
 PENDING_HARD_LIMIT = 100
 MIN_INTERVAL_SECONDS = 30
@@ -68,6 +71,7 @@ _MONTH_MAP = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
+_TZ_CN = timezone(timedelta(hours=8))
 _STD_TIME_RE = re.compile(
     r"^(\w{3}) (\w{3}) (\d{1,2}) (\d{2}):(\d{2}):(\d{2}) \+0800 (\d{4})$"
 )
@@ -118,6 +122,24 @@ def _clean_text(raw: str, limit: int) -> str:
     if limit > 0 and len(text) > limit:
         text = text[:limit].rstrip() + "…"
     return text
+
+
+def _parse_created_epoch(raw: str) -> float:
+    """把微博标准时间（Sat Mar 08 16:51:30 +0800 2025）解析为 Unix 时间戳。
+
+    相对时间等无法解析的格式返回 0，由调用方采用宽松策略。
+    """
+    m = _STD_TIME_RE.match((raw or "").strip())
+    if not m or m.group(2) not in _MONTH_MAP:
+        return 0.0
+    try:
+        dt = datetime(
+            int(m.group(7)), _MONTH_MAP[m.group(2)], int(m.group(3)),
+            int(m.group(4)), int(m.group(5)), int(m.group(6)), tzinfo=_TZ_CN,
+        )
+        return dt.timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _format_time(raw: str) -> str:
@@ -189,7 +211,7 @@ class WeiboMonitorPlugin(Star):
         self._proxy: str | None = None
         # uid -> {"name", "seen_ids"(list), "baseline_done"}
         self.accounts: dict[str, dict[str, Any]] = {}
-        # 待推送队列: [{"post_id","uid","text","retries"}]
+        # 待推送队列: [{"post_id","uid","text","created_ts","retries"}]
         self.pending: list[dict[str, Any]] = []
         self.last_check_ts = 0.0
 
@@ -245,6 +267,15 @@ class WeiboMonitorPlugin(Star):
             return max(0, int(self.config.get(key) or default))
         except (TypeError, ValueError):
             return default
+
+    def _message_format(self) -> str:
+        return str(self.config.get("message_format") or DEFAULT_MESSAGE_FORMAT).replace(
+            "\\n", "\n"
+        )
+
+    def _max_post_age(self) -> float:
+        """时效过滤上限（秒）；0 表示关闭。"""
+        return float(self._int_cfg("max_post_age_minutes", 0) * 60)
 
     def _sync_accounts_from_config(self):
         """以配置里的 monitored_uids 为准同步监控列表（兼容 WebUI 直接改动）。"""
@@ -395,16 +426,16 @@ class WeiboMonitorPlugin(Star):
                 await asyncio.sleep(1.5 * (2**attempt))
         raise WeiboFetchError(f"请求失败: {last_err}")
 
-    async def _api_get(self, params: dict[str, Any],
+    async def _api_get(self, url: str, params: dict[str, Any],
                        referer: str | None = None) -> dict[str, Any]:
-        """GET m.weibo.cn 接口。
+        """GET m.weibo.cn JSON 接口。
 
         ok=-100（游客身份过期）→ 换新身份重试一次；
         HTTP 418/432（IP 级风控）→ 记录全局冷却并换新身份，重试一次。
         """
         for attempt in (1, 2):
             try:
-                data = await self._api_get_once(params, referer)
+                data = await self._api_get_once(url, params, referer)
                 # 成功即解除风控冷却
                 self._risk_level = 0
                 self._blocked_until = 0.0
@@ -421,7 +452,7 @@ class WeiboMonitorPlugin(Star):
                 await self._renew_visitor(force=True)
         raise WeiboFetchError("unreachable")  # pragma: no cover
 
-    async def _api_get_once(self, params: dict[str, Any],
+    async def _api_get_once(self, url: str, params: dict[str, Any],
                             referer: str | None) -> dict[str, Any]:
         if self._http is None:
             raise WeiboFetchError("HTTP 会话未初始化")
@@ -436,7 +467,7 @@ class WeiboMonitorPlugin(Star):
         xsrf = self._visitor_cookies.get("XSRF-TOKEN", "")
         if xsrf:
             headers["X-Xsrf-Token"] = xsrf
-        body = await self._get_text(WEIBO_INDEX_URL, params, headers)
+        body = await self._get_text(url, params, headers)
         try:
             data = json.loads(body)
         except json.JSONDecodeError as e:
@@ -600,9 +631,39 @@ class WeiboMonitorPlugin(Star):
 
     # ---------------- 数据获取与解析 ----------------
 
+    async def _resolve_long_text(self, mb: dict[str, Any], uid: str,
+                                 summary: str) -> str:
+        """超长微博全文：/statuses/extend 拉取，失败安全回退摘要。
+
+        已实测游客身份可用（ok=1，data.longTextContent 为含 HTML 的全文）。
+        """
+        if not bool(self.config.get("show_full_weibo_text", False)):
+            return summary
+        if not mb.get("isLongText"):
+            return summary
+        status_id = str(mb.get("id") or mb.get("mid") or "")
+        if not status_id:
+            return summary
+        try:
+            data = await self._api_get(
+                WEIBO_EXTEND_URL,
+                {"id": status_id},
+                referer=f"https://m.weibo.cn/detail/{status_id}",
+            )
+            long_text = (data.get("data") or {}).get("longTextContent")
+            if isinstance(long_text, str) and long_text.strip():
+                return _clean_text(long_text, self._int_cfg("text_max_length", 100))
+            logger.info(f"长微博 {status_id} 全文响应缺少正文，使用摘要")
+        except asyncio.CancelledError:
+            raise
+        except WeiboFetchError as e:
+            logger.info(f"获取长微博 {status_id} 全文失败，使用摘要: {e}")
+        return summary
+
     async def _fetch_timeline(self, uid: str) -> list[dict[str, Any]]:
         """拉取用户最新一页微博，返回解析后的帖子列表（新→旧）。"""
         data = await self._api_get(
+            WEIBO_INDEX_URL,
             {
                 "type": "uid",
                 "value": uid,
@@ -621,14 +682,19 @@ class WeiboMonitorPlugin(Star):
             if self._is_pinned(card, mb):
                 continue
             post = self._parse_post(mb, uid)
-            if post:
-                posts.append(post)
+            if not post:
+                continue
+            post["text"] = await self._resolve_long_text(
+                mb, uid, str(post.get("text") or "")
+            )
+            posts.append(post)
         return posts
 
     async def _fetch_nickname(self, uid: str) -> str | None:
         """通过用户资料容器拉取昵称，失败返回 None。"""
         try:
             data = await self._api_get(
+                WEIBO_INDEX_URL,
                 {"type": "uid", "value": uid, "containerid": f"100505{uid}"},
                 referer=f"https://m.weibo.cn/u/{uid}",
             )
@@ -661,6 +727,7 @@ class WeiboMonitorPlugin(Star):
         uid = str(user.get("id") or fallback_uid)
         bid = str(mb.get("bid") or pid)
         limit = self._int_cfg("text_max_length", 100)
+        created_raw = str(mb.get("created_at") or "")
 
         own_text = _clean_text(str(mb.get("text") or ""), limit)
         orig_name, orig_text = "", ""
@@ -676,26 +743,48 @@ class WeiboMonitorPlugin(Star):
             "uid": uid,
             "author": str(user.get("screen_name") or "") or uid,
             "link": f"https://weibo.com/{uid}/{bid}",
-            "time": _format_time(str(mb.get("created_at") or "")),
+            "time": _format_time(created_raw),
+            "created_ts": _parse_created_epoch(created_raw),
             "text": own_text,
             "is_retweet": is_retweet,
             "orig_name": orig_name,
             "orig_text": orig_text,
         }
 
+    def _post_body(self, post: dict[str, Any]) -> str:
+        """模板 {weibo} 占位符的正文内容。"""
+        if post["is_retweet"]:
+            parts: list[str] = []
+            if post["text"]:
+                parts.append(post["text"])
+            who = post["orig_name"] or "原作者"
+            parts.append(f"转发 @{who}：{post['orig_text'] or '（原微博内容不可见）'}")
+            return "\n".join(parts)
+        return post["text"] or ""
+
+    def _keyword_hit(self, post: dict[str, Any]) -> str | None:
+        """关键词过滤：命中屏蔽词或被白名单排除时返回原因，否则 None。"""
+        text = f"{post['text']}\n{post['orig_text']}"
+        for kw in self.config.get("filter_keywords") or []:
+            kw = str(kw).strip()
+            if kw and kw in text:
+                return f"包含屏蔽词“{kw}”"
+        whitelist = [str(k).strip() for k in (self.config.get("whitelist_keywords") or [])
+                     if str(k).strip()]
+        if whitelist and not any(kw in text for kw in whitelist):
+            return "未包含任何白名单关键词"
+        return None
+
     def _build_message(self, post: dict[str, Any]) -> str:
         name = self.accounts.get(post["uid"], {}).get("name") or post["author"]
-        lines = ["📢 微博更新", f"【{name}】{post['time']}"]
-        if post["is_retweet"]:
-            if post["text"]:
-                lines.append(post["text"])
-            who = post["orig_name"] or "原作者"
-            body = f"转发 @{who}：{post['orig_text'] or '（原微博内容不可见）'}"
-            lines.append(body)
-        elif post["text"]:
-            lines.append(post["text"])
-        lines.append(f"🔗 {post['link']}")
-        return "\n".join(line for line in lines if line)
+        msg = (
+            self._message_format()
+            .replace("{name}", name)
+            .replace("{time}", post["time"])
+            .replace("{weibo}", self._post_body(post))
+            .replace("{link}", post["link"])
+        )
+        return re.sub(r"\n{3,}", "\n\n", msg).strip()
 
     # ---------------- 轮询与推送 ----------------
 
@@ -718,6 +807,16 @@ class WeiboMonitorPlugin(Star):
                 await asyncio.sleep(min(60, interval))
             else:
                 await asyncio.sleep(interval + jitter)
+
+    def _is_expired(self, created_ts: float, at_ts: float | None = None) -> bool:
+        """时效过滤：超过 max_post_age_minutes 的微博视为过期。
+
+        发布时间无法解析（created_ts=0）时宽松放行。
+        """
+        max_age = self._max_post_age()
+        if max_age <= 0 or not created_ts:
+            return False
+        return (at_ts or time.time()) - created_ts > max_age
 
     async def check_all(self) -> int:
         """检查一轮所有账号并推送，返回本轮新检测到的微博数。"""
@@ -783,7 +882,13 @@ class WeiboMonitorPlugin(Star):
         include_rt = bool(self.config.get("include_retweets", True))
         for post in reversed(new_posts):  # 旧→新依次入队
             seen.add(post["id"])
+            if self._is_expired(post.get("created_ts", 0.0)):
+                continue
             if post["is_retweet"] and not include_rt:
+                continue
+            hit = self._keyword_hit(post)
+            if hit:
+                logger.info(f"微博 {post['id']} {hit}，已跳过推送")
                 continue
             if len(self.pending) >= PENDING_HARD_LIMIT:
                 logger.warning("待推送队列已满，丢弃更早的新微博")
@@ -793,11 +898,33 @@ class WeiboMonitorPlugin(Star):
                     "post_id": post["id"],
                     "uid": post["uid"],
                     "text": self._build_message(post),
+                    "created_ts": post.get("created_ts", 0.0),
                     "retries": 0,
                 }
             )
         info["seen_ids"] = list(seen)[-SEEN_IDS_LIMIT:]
         return len(new_posts)
+
+    async def _send_with_timeout(self, session: str, text: str) -> bool:
+        """带超时的主动消息发送，防止单个适配器卡死拖住整个轮询任务。"""
+        send_timeout = self._int_cfg("message_send_timeout", 60)
+        try:
+            if send_timeout > 0:
+                ok = await asyncio.wait_for(
+                    self.context.send_message(session, MessageChain().message(text)),
+                    timeout=send_timeout,
+                )
+            else:
+                ok = await self.context.send_message(
+                    session, MessageChain().message(text)
+                )
+            if ok is False:
+                raise RuntimeError("AstrBot 未找到匹配的消息平台")
+            return True
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(f"发送超过 {send_timeout} 秒，平台是否已接收未知") from e
 
     async def _flush_pending(self):
         """把待推送队列发送到所有绑定的会话。"""
@@ -806,6 +933,9 @@ class WeiboMonitorPlugin(Star):
         sessions = self._sessions()
         remaining: list[dict[str, Any]] = []
         for item in self.pending:
+            if self._is_expired(item.get("created_ts", 0.0)):
+                logger.info(f"待推送微博 {item['post_id']} 已超过时效上限，自动清除")
+                continue
             if not sessions:
                 # 未绑定推送目标：保留消息但不消耗重试次数
                 remaining.append(item)
@@ -816,12 +946,11 @@ class WeiboMonitorPlugin(Star):
             sent = False
             for session in sessions:
                 try:
-                    ok = await self.context.send_message(
-                        session, MessageChain().message(item["text"])
-                    )
-                    sent = sent or bool(ok)
+                    sent = sent or await self._send_with_timeout(session, item["text"])
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
-                    logger.warning(f"推送到 {session} 异常: {e!r}")
+                    logger.warning(f"推送到 {session} 失败: {e!r}")
             if sent:
                 logger.info(f"已推送微博 {item['post_id']}")
             else:

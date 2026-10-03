@@ -20,10 +20,38 @@
     "type": "bool",
     "default": true
   },
+  "message_format": {
+    "description": "推送消息模板",
+    "type": "string",
+    "default": "📢 微博更新\n【{name}】{time}\n{weibo}\n🔗 {link}",
+    "hint": "支持占位符：{name} 昵称、{time} 发布时间、{weibo} 正文、{link} 链接；\\n 表示换行"
+  },
   "text_max_length": {
     "description": "推送正文的摘要最大长度（字符数，超出截断加省略号）",
     "type": "int",
     "default": 100
+  },
+  "show_full_weibo_text": {
+    "description": "完整展示超长微博正文",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会为超长微博额外请求全文（游客身份可用，已实测）；获取失败时自动回退摘要。注意这会增加每轮请求数"
+  },
+  "max_post_age_minutes": {
+    "description": "不推送超过此时长的微博（分钟），0 表示不限制",
+    "type": "int",
+    "default": 0,
+    "hint": "例如填写 30，则只推送 30 分钟内发布的新微博；对失败重试的过期待办同样生效（自动清除），适合保持“实时转发”语义"
+  },
+  "filter_keywords": {
+    "description": "屏蔽词列表（正文命中任一屏蔽词则不推送）",
+    "type": "list",
+    "default": []
+  },
+  "whitelist_keywords": {
+    "description": "关键词白名单（非空时，正文需包含任一关键词才推送）",
+    "type": "list",
+    "default": []
   },
   "push_delay_seconds": {
     "description": "多条推送消息之间的间隔秒数（防刷屏与QQ风控）",
@@ -34,6 +62,12 @@
     "description": "单条推送失败后的最大重试轮数，超过后放弃",
     "type": "int",
     "default": 20
+  },
+  "message_send_timeout": {
+    "description": "单条消息发送超时（秒），0 表示不限制",
+    "type": "int",
+    "default": 60,
+    "hint": "防止单个平台适配器无响应时卡住整个轮询任务"
   },
   "custom_cookie": {
     "description": "可选：自定义微博 Cookie（正常情况留空，插件完全免 Cookie 运行）",
