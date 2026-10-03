@@ -22,6 +22,21 @@
 
 要求 AstrBot ≥ v3.5.19（推荐 v4.x），QQ 侧使用 aiocqhttp 适配器（NapCat、Lagrange 等）。
 
+## 升级
+
+**方式一：AstrBot ≥ v4.28.2** —— 直接在 WebUI 上传新版本 zip 即可覆盖升级（自动备份旧目录，更新失败会自动恢复旧版本）。
+
+> 注意：v4.28.0 / v4.28.1 上传同名 zip 会报「安装失败：目录 astrbot_plugin_weibo_monitor 已存在」，这是 AstrBot 该版本的限制。请先升级 AstrBot，或用方式二。
+
+**方式二：先卸载再上传（任何版本通用）**
+
+1. WebUI「插件」页卸载旧版本，**不要勾选「删除配置」**；
+2. 上传新版本 zip。
+
+**数据不会丢失**：插件配置存于 `data/config/astrbot_plugin_weibo_monitor_config.json`，运行状态（已见微博、游客身份、待推送队列）存于 `data/plugin_data/astrbot_plugin_weibo_monitor/state.json`，均不在插件目录内，上述操作不影响。
+
+**方式三（推荐长期使用）：仓库安装** —— 把插件推送到 GitHub 仓库后，用 WebUI「从仓库安装」安装，此后每次升级只需点击插件列表的「更新」按钮。
+
 ## 快速上手
 
 1. 在要接收推送的 Q 群里（由 AstrBot 管理员账号）发送：
