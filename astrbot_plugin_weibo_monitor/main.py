@@ -59,6 +59,8 @@ DEFAULT_MESSAGE_FORMAT = "📢 微博更新\n【{name}】{time}\n{weibo}\n🔗 {
 SEEN_IDS_LIMIT = 500
 PENDING_HARD_LIMIT = 100
 MIN_INTERVAL_SECONDS = 30
+# show_full_weibo_text 开启时全文的安全上限（防超长文本刷屏/QQ 风控）
+FULL_TEXT_MAX_CHARS = 2000
 VISITOR_MAX_AGE = 3 * 24 * 3600   # 游客身份最长复用 3 天，到期主动换新
 RENEW_COOLDOWN = 600.0            # 主动续期最小间隔（秒）：频繁 genvisitor 本身是风控信号
 RENEW_MAX_PER_HOUR = 3            # 每小时最多续期尝试次数
@@ -66,6 +68,8 @@ RENEW_FAIL_BACKOFF = 600.0        # 续期失败退避基数（秒），指数�
 REQUEST_GAP = (2.0, 5.0)          # 相邻两次微博请求的最小随机间隔（秒）
 # HTTP 418/432 属于 IP 级风控：全局冷却梯度（秒），触发后暂停所有微博请求
 RISK_COOLDOWN_STEPS = (600, 1800, 3600)
+# 距上次风控触发超过该时长后冷却梯度重置，避免历史偶发触发导致永久 60 分钟冷却
+RISK_ESCALATION_RESET = 2 * 3600
 
 _MONTH_MAP = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
@@ -206,9 +210,15 @@ class WeiboMonitorPlugin(Star):
         # IP 级风控全局冷却
         self._blocked_until = 0.0
         self._risk_level = 0
+        self._last_risk_ts = 0.0
         # 全局请求间隔
         self._last_request_mono = 0.0
         self._proxy: str | None = None
+        # 自定义 Cookie（config.custom_cookie，非空时优先于游客身份）
+        self._custom_cookies: dict[str, str] = {}
+        # 并发闸：请求间隔与游客续期在轮询任务与指令处理并发时同样全局生效
+        self._pace_lock = asyncio.Lock()
+        self._renew_lock = asyncio.Lock()
         # uid -> {"name", "seen_ids"(list), "baseline_done"}
         self.accounts: dict[str, dict[str, Any]] = {}
         # 待推送队列: [{"post_id","uid","text","created_ts","retries"}]
@@ -232,8 +242,17 @@ class WeiboMonitorPlugin(Star):
                 logger.warning(
                     f"{PLUGIN_NAME} proxy 配置无效（需 http:// 或 https:// 开头），已忽略: {proxy}"
                 )
+        # 自定义 Cookie 模式：直接使用用户身份，跳过游客身份的预热与续期
+        self._custom_cookies = self._parse_cookie_string(
+            str(self.config.get("custom_cookie") or "")
+        )
         # 启动预热：身份过期则换新；身份健在则访问一次主页刷新 _T_WM/XSRF 指纹
-        if self._visitor_cookies.get("SUB") and (
+        if self._custom_cookies:
+            logger.info(
+                f"{PLUGIN_NAME} 已启用自定义 Cookie（{sorted(self._custom_cookies)}），"
+                "游客身份流程已跳过"
+            )
+        elif self._visitor_cookies.get("SUB") and (
             time.time() - self._visitor_ts <= VISITOR_MAX_AGE
         ):
             await self._warmup_quietly()
@@ -320,7 +339,13 @@ class WeiboMonitorPlugin(Star):
                 "fail_count": 0,
                 "next_retry_ts": 0.0,
             }
-        self.pending = list(state.get("pending") or [])
+        pending: list[dict[str, Any]] = []
+        for item in state.get("pending") or []:
+            if isinstance(item, dict) and item.get("post_id") and item.get("text"):
+                item.setdefault("retries", 0)
+                item.setdefault("created_ts", 0.0)
+                pending.append(item)
+        self.pending = pending[-PENDING_HARD_LIMIT:]
         self.last_check_ts = float(state.get("last_check_ts") or 0)
         visitor = state.get("visitor") or {}
         cookies = visitor.get("cookies") or {}
@@ -386,12 +411,16 @@ class WeiboMonitorPlugin(Star):
                 raise WeiboFetchError(f"域名解析到受限地址，已拦截: {ip}")
 
     async def _pace(self):
-        """全局请求间隔：任意两次微博请求之间至少间隔 REQUEST_GAP 内的随机秒数。"""
-        gap = random.uniform(*REQUEST_GAP)
-        wait = self._last_request_mono + gap - time.monotonic()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._last_request_mono = time.monotonic()
+        """全局请求间隔：任意两次微博请求之间至少间隔 REQUEST_GAP 内的随机秒数。
+
+        加锁串行，保证轮询任务与指令处理并发时同样全局生效。
+        """
+        async with self._pace_lock:
+            gap = random.uniform(*REQUEST_GAP)
+            wait = self._last_request_mono + gap - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_mono = time.monotonic()
 
     def _base_headers(self) -> dict[str, str]:
         return {
@@ -423,7 +452,8 @@ class WeiboMonitorPlugin(Star):
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_err = e
-                await asyncio.sleep(1.5 * (2**attempt))
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (2**attempt))
         raise WeiboFetchError(f"请求失败: {last_err}")
 
     async def _api_get(self, url: str, params: dict[str, Any],
@@ -431,8 +461,13 @@ class WeiboMonitorPlugin(Star):
         """GET m.weibo.cn JSON 接口。
 
         ok=-100（游客身份过期）→ 换新身份重试一次；
-        HTTP 418/432（IP 级风控）→ 记录全局冷却并换新身份，重试一次。
+        HTTP 418/432（IP 级风控）→ 记录全局冷却并换新身份，重试一次；
+        冷却期内直接快速失败，避免冷却期间继续向微博出网。
         """
+        if time.time() < self._blocked_until:
+            raise WeiboFetchError(
+                f"微博风控冷却中（剩余 {int(self._blocked_until - time.time())} 秒）"
+            )
         for attempt in (1, 2):
             try:
                 data = await self._api_get_once(url, params, referer)
@@ -456,17 +491,22 @@ class WeiboMonitorPlugin(Star):
                             referer: str | None) -> dict[str, Any]:
         if self._http is None:
             raise WeiboFetchError("HTTP 会话未初始化")
-        if not self._visitor_cookies.get("SUB"):
-            await self._renew_visitor()
         headers = self._base_headers()
         headers.update(API_HEADERS)
         headers["Referer"] = referer or "https://m.weibo.cn/"
+        if self._custom_cookies:
+            # 自定义 Cookie 模式：直接使用用户身份，不走游客续期
+            cookies = self._custom_cookies
+        else:
+            if not self._visitor_cookies.get("SUB"):
+                await self._renew_visitor()
+            cookies = self._visitor_cookies
+            xsrf = cookies.get("XSRF-TOKEN", "")
+            if xsrf:
+                headers["X-Xsrf-Token"] = xsrf
         headers["Cookie"] = "; ".join(
-            f"{k}={v}" for k, v in self._visitor_cookies.items()
+            f"{k}={v}" for k, v in cookies.items()
         )
-        xsrf = self._visitor_cookies.get("XSRF-TOKEN", "")
-        if xsrf:
-            headers["X-Xsrf-Token"] = xsrf
         body = await self._get_text(url, params, headers)
         try:
             data = json.loads(body)
@@ -475,17 +515,30 @@ class WeiboMonitorPlugin(Star):
         if not isinstance(data, dict):
             raise WeiboFetchError("接口返回异常")
         if data.get("ok") == -100:
+            if self._custom_cookies:
+                # 自定义 Cookie 失效时换新游客身份没有意义，直接报错由调用方回退
+                raise WeiboFetchError("自定义 Cookie 已失效（接口要求登录）")
             raise WeiboAuthError("接口要求登录（ok=-100）")
         if data.get("ok") != 1:
             raise WeiboFetchError(f"接口返回异常 ok={data.get('ok')}")
         return data
 
     def _mark_risk_blocked(self, e: Exception):
-        """IP 级风控：全局冷却并按连续触发次数升级（10 → 30 → 60 分钟）。"""
+        """IP 级风控：全局冷却并按连续触发次数升级（10 → 30 → 60 分钟）。
+
+        冷却期内重复触发不叠加升级（同一轮请求的多次 432 只算一次）；
+        距上次触发超过 RISK_ESCALATION_RESET 后梯度重置。
+        """
+        now = time.time()
+        if now < self._blocked_until:
+            return
+        if now - self._last_risk_ts > RISK_ESCALATION_RESET:
+            self._risk_level = 0
+        self._last_risk_ts = now
         level = self._risk_level
         cooldown = RISK_COOLDOWN_STEPS[min(level, len(RISK_COOLDOWN_STEPS) - 1)]
         self._risk_level = min(level + 1, len(RISK_COOLDOWN_STEPS) - 1)
-        self._blocked_until = time.time() + cooldown
+        self._blocked_until = now + cooldown
         logger.warning(
             f"{PLUGIN_NAME} 触发微博风控，全局冷却 {cooldown // 60} 分钟"
             f"（连续第 {level + 1} 次触发）: {e}"
@@ -527,41 +580,43 @@ class WeiboMonitorPlugin(Star):
 
         节流策略：每小时最多 RENEW_MAX_PER_HOUR 次尝试；
         失败后指数退避；非强制模式下受 RENEW_COOLDOWN 冷却限制。
+        加锁串行，避免指令处理与轮询任务并发触发双重换新。
         """
-        if self._http is None:
-            raise WeiboFetchError("HTTP 会话未初始化")
-        now = time.time()
-        recent = [t for t in self._renew_times if now - t < 3600.0]
-        self._renew_times = recent
-        if len(recent) >= RENEW_MAX_PER_HOUR:
-            raise WeiboFetchError(
-                f"游客身份续期已达每小时上限（{RENEW_MAX_PER_HOUR} 次），稍后自动重试"
-            )
-        if now < self._renew_fail_until:
-            raise WeiboFetchError(
-                "上次续期失败，退避中："
-                f"{datetime.fromtimestamp(self._renew_fail_until).strftime('%H:%M:%S')} 后自动重试"
-            )
-        if (
-            not force
-            and self._visitor_cookies.get("SUB")
-            and now - self._last_renew_ts < RENEW_COOLDOWN
-        ):
-            return  # 冷却期内且现有身份尚在，直接复用
-        self._renew_times.append(now)
-        self._last_renew_ts = now
-        try:
-            await self._do_renew()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._renew_fail_count += 1
-            backoff = min(3600.0, RENEW_FAIL_BACKOFF * (2 ** (self._renew_fail_count - 1)))
-            self._renew_fail_until = time.time() + backoff
-            raise
-        self._renew_fail_count = 0
-        self._renew_fail_until = 0.0
-        self._save_state()
+        async with self._renew_lock:
+            if self._http is None:
+                raise WeiboFetchError("HTTP 会话未初始化")
+            now = time.time()
+            recent = [t for t in self._renew_times if now - t < 3600.0]
+            self._renew_times = recent
+            if len(recent) >= RENEW_MAX_PER_HOUR:
+                raise WeiboFetchError(
+                    f"游客身份续期已达每小时上限（{RENEW_MAX_PER_HOUR} 次），稍后自动重试"
+                )
+            if now < self._renew_fail_until:
+                raise WeiboFetchError(
+                    "上次续期失败，退避中："
+                    f"{datetime.fromtimestamp(self._renew_fail_until).strftime('%H:%M:%S')} 后自动重试"
+                )
+            if (
+                not force
+                and self._visitor_cookies.get("SUB")
+                and now - self._last_renew_ts < RENEW_COOLDOWN
+            ):
+                return  # 冷却期内且现有身份尚在，直接复用
+            self._renew_times.append(now)
+            self._last_renew_ts = now
+            try:
+                await self._do_renew()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._renew_fail_count += 1
+                backoff = min(3600.0, RENEW_FAIL_BACKOFF * (2 ** (self._renew_fail_count - 1)))
+                self._renew_fail_until = time.time() + backoff
+                raise
+            self._renew_fail_count = 0
+            self._renew_fail_until = 0.0
+            self._save_state()
 
     async def _do_renew(self):
         assert self._http is not None
@@ -621,6 +676,21 @@ class WeiboMonitorPlugin(Star):
         logger.info(f"{PLUGIN_NAME} 游客身份已更新（{sorted(cookies)}）")
 
     @staticmethod
+    def _parse_cookie_string(raw: str) -> dict[str, str]:
+        """把 "k1=v1; k2=v2" 形式的 Cookie 字符串解析为字典。"""
+        cookies: dict[str, str] = {}
+        for part in (raw or "").split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            k, _, v = part.partition("=")
+            k = k.strip()
+            v = v.strip()
+            if k:
+                cookies[k] = v
+        return cookies
+
+    @staticmethod
     def _merge_cookies(target: dict[str, str], resp: aiohttp.ClientResponse):
         """把响应 Set-Cookie 合入字典（仅保留 weibo 相关域）。"""
         for key, morsel in resp.cookies.items():
@@ -631,19 +701,24 @@ class WeiboMonitorPlugin(Star):
 
     # ---------------- 数据获取与解析 ----------------
 
-    async def _resolve_long_text(self, mb: dict[str, Any], uid: str,
-                                 summary: str) -> str:
-        """超长微博全文：/statuses/extend 拉取，失败安全回退摘要。
+    async def _apply_full_text(self, mb: dict[str, Any], post: dict[str, Any]):
+        """show_full_weibo_text 开启时拉取超长微博全文，替换摘要。
 
-        已实测游客身份可用（ok=1，data.longTextContent 为含 HTML 的全文）。
+        覆盖外层微博与转发原微博两处；任一获取失败安全回退摘要。
+        已实测 /statuses/extend 游客身份可用（ok=1，data.longTextContent 为含 HTML 的全文）。
         """
-        if not bool(self.config.get("show_full_weibo_text", False)):
-            return summary
-        if not mb.get("isLongText"):
-            return summary
         status_id = str(mb.get("id") or mb.get("mid") or "")
-        if not status_id:
-            return summary
+        if status_id and mb.get("isLongText"):
+            full = await self._fetch_long_text(status_id)
+            if full:
+                post["text"] = full
+        if post["is_retweet"] and post.get("orig_id") and post.get("orig_is_long"):
+            full = await self._fetch_long_text(str(post["orig_id"]))
+            if full:
+                post["orig_text"] = full
+
+    async def _fetch_long_text(self, status_id: str) -> str | None:
+        """拉取超长微博全文，失败返回 None（调用方回退摘要）。"""
         try:
             data = await self._api_get(
                 WEIBO_EXTEND_URL,
@@ -652,13 +727,14 @@ class WeiboMonitorPlugin(Star):
             )
             long_text = (data.get("data") or {}).get("longTextContent")
             if isinstance(long_text, str) and long_text.strip():
-                return _clean_text(long_text, self._int_cfg("text_max_length", 100))
+                # 全文用独立的安全上限，不受摘要 text_max_length 影响
+                return _clean_text(long_text, FULL_TEXT_MAX_CHARS)
             logger.info(f"长微博 {status_id} 全文响应缺少正文，使用摘要")
         except asyncio.CancelledError:
             raise
         except WeiboFetchError as e:
             logger.info(f"获取长微博 {status_id} 全文失败，使用摘要: {e}")
-        return summary
+        return None
 
     async def _fetch_timeline(self, uid: str) -> list[dict[str, Any]]:
         """拉取用户最新一页微博，返回解析后的帖子列表（新→旧）。"""
@@ -674,6 +750,7 @@ class WeiboMonitorPlugin(Star):
             referer=f"https://m.weibo.cn/u/{uid}",
         )
         cards = (data.get("data") or {}).get("cards") or []
+        show_full = bool(self.config.get("show_full_weibo_text", False))
         posts: list[dict[str, Any]] = []
         for card in cards:
             if card.get("card_type") != 9:
@@ -684,9 +761,8 @@ class WeiboMonitorPlugin(Star):
             post = self._parse_post(mb, uid)
             if not post:
                 continue
-            post["text"] = await self._resolve_long_text(
-                mb, uid, str(post.get("text") or "")
-            )
+            if show_full:
+                await self._apply_full_text(mb, post)
             posts.append(post)
         return posts
 
@@ -730,13 +806,16 @@ class WeiboMonitorPlugin(Star):
         created_raw = str(mb.get("created_at") or "")
 
         own_text = _clean_text(str(mb.get("text") or ""), limit)
-        orig_name, orig_text = "", ""
+        orig_name, orig_text, orig_id = "", "", ""
+        orig_is_long = False
         is_retweet = "retweeted_status" in mb
         if is_retweet:
             rt = mb.get("retweeted_status") or {}
             rt_user = rt.get("user") or {}
             orig_name = str(rt_user.get("screen_name") or "")
             orig_text = _clean_text(str(rt.get("text") or ""), limit)
+            orig_id = str(rt.get("id") or rt.get("mid") or "")
+            orig_is_long = bool(rt.get("isLongText"))
 
         return {
             "id": pid,
@@ -749,6 +828,8 @@ class WeiboMonitorPlugin(Star):
             "is_retweet": is_retweet,
             "orig_name": orig_name,
             "orig_text": orig_text,
+            "orig_id": orig_id,
+            "orig_is_long": orig_is_long,
         }
 
     def _post_body(self, post: dict[str, Any]) -> str:
@@ -796,7 +877,7 @@ class WeiboMonitorPlugin(Star):
             try:
                 pushed = await self.check_all()
                 if pushed:
-                    logger.info(f"本轮共推送 {pushed} 条新微博")
+                    logger.info(f"本轮共检测到 {pushed} 条新微博")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -828,17 +909,17 @@ class WeiboMonitorPlugin(Star):
         self._checking = True
         try:
             self._sync_accounts_from_config()
-            if not self._visitor_cookies.get("SUB") or (
-                time.time() - self._visitor_ts > VISITOR_MAX_AGE
+            if not self._custom_cookies and (
+                not self._visitor_cookies.get("SUB")
+                or time.time() - self._visitor_ts > VISITOR_MAX_AGE
             ):
                 await self._renew_visitor_quietly()
             new_count = 0
-            now = time.time()
             for uid, info in list(self.accounts.items()):
                 if time.time() < self._blocked_until:
                     logger.warning(f"{PLUGIN_NAME} 风控冷却生效，本轮剩余账号跳过")
                     break
-                if now < info.get("next_retry_ts", 0):
+                if time.time() < info.get("next_retry_ts", 0):
                     continue
                 try:
                     new_count += await self._check_account(uid)
@@ -931,8 +1012,9 @@ class WeiboMonitorPlugin(Star):
         max_retries = self._int_cfg("max_pending_retries", 20)
         delay = self._int_cfg("push_delay_seconds", 2)
         sessions = self._sessions()
+        total = len(self.pending)
         remaining: list[dict[str, Any]] = []
-        for item in self.pending:
+        for idx, item in enumerate(self.pending):
             if self._is_expired(item.get("created_ts", 0.0)):
                 logger.info(f"待推送微博 {item['post_id']} 已超过时效上限，自动清除")
                 continue
@@ -940,13 +1022,14 @@ class WeiboMonitorPlugin(Star):
                 # 未绑定推送目标：保留消息但不消耗重试次数
                 remaining.append(item)
                 continue
-            if item["retries"] >= max_retries:
+            if item.get("retries", 0) >= max_retries:
                 logger.warning(f"推送重试超限，放弃微博 {item['post_id']}")
                 continue
             sent = False
             for session in sessions:
                 try:
-                    sent = sent or await self._send_with_timeout(session, item["text"])
+                    if await self._send_with_timeout(session, item["text"]):
+                        sent = True
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -954,9 +1037,10 @@ class WeiboMonitorPlugin(Star):
             if sent:
                 logger.info(f"已推送微博 {item['post_id']}")
             else:
-                item["retries"] += 1
+                item["retries"] = item.get("retries", 0) + 1
                 remaining.append(item)
-            if delay:
+            # 多条之间留间隔防刷屏；最后一条之后无需再等
+            if delay and idx < total - 1:
                 await asyncio.sleep(delay)
         if not sessions and len(remaining) > PENDING_HARD_LIMIT:
             remaining = remaining[-PENDING_HARD_LIMIT:]
@@ -1076,6 +1160,9 @@ class WeiboMonitorPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def weibo_check(self, event: AstrMessageEvent):
         """立即检查一轮微博更新（管理员）"""
+        if self._checking:
+            yield event.plain_result("已有检查任务在进行中，请稍候再试")
+            return
         if not self.accounts:
             yield event.plain_result("尚未监控任何账号，请先用 微博添加 添加")
             return
@@ -1088,7 +1175,7 @@ class WeiboMonitorPlugin(Star):
         yield event.plain_result("正在检查微博更新…")
         new_count = await self.check_all()
         if new_count:
-            yield event.plain_result(f"检查完成，本轮新增 {new_count} 条微博")
+            yield event.plain_result(f"检查完成，本轮检测到 {new_count} 条新微博")
         else:
             yield event.plain_result("检查完成，暂无新微博")
 
@@ -1115,5 +1202,9 @@ class WeiboMonitorPlugin(Star):
             lines.append(f"游客身份：{age:.1f} 小时前更新")
         else:
             lines.append("游客身份：未获取")
+        if self._custom_cookies:
+            lines.append(f"身份模式：自定义 Cookie（{sorted(self._custom_cookies)}）")
+        else:
+            lines.append("身份模式：免 Cookie 游客身份")
         lines.append(f"出网方式：{'代理 ' + self._proxy if self._proxy else '直连'}")
         yield event.plain_result("\n".join(lines))
