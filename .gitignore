@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+.ruff_cache/
 
 # 打包产物（发布时用 GitHub Release 或手动分发）
 *.zip
@@ -11,3 +12,5 @@ __pycache__/
 .playwright-mcp/
 _test_data/
 .playwright-mcp/
+# 本地开发用的 A/B bench 跑测脚本与产物，不随插件发布
+bench/

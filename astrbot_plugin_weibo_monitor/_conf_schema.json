@@ -26,6 +26,12 @@
     "default": "📢 微博更新\n【{name}】{time}\n{weibo}\n🔗 {link}",
     "hint": "支持占位符：{name} 昵称、{time} 发布时间、{weibo} 正文、{link} 链接；\\n 表示换行"
   },
+  "message_with_images": {
+    "description": "推送消息附带微博图片（mw2000 轻量档，跟随图片数上限截断）",
+    "type": "bool",
+    "default": true,
+    "hint": "消息里的图由协议端自己远程抓取，因此用长边 2000px 的轻量档：单张几百 KB，不会把发送顶到超时后重复推送。群相册那条路仍然传 /large/ 原图，不受此项影响；关闭后推送消息保持纯文本"
+  },
   "text_max_length": {
     "description": "推送正文的摘要最大长度（字符数，超出截断加省略号）",
     "type": "int",
@@ -52,6 +58,65 @@
     "description": "关键词白名单（非空时，正文需包含任一关键词才推送）",
     "type": "list",
     "default": []
+  },
+  "album_enabled": {
+    "description": "微博图片自动上传群相册（总开关）",
+    "type": "bool",
+    "default": true,
+    "hint": "需先用 微博相册绑定 <uid> <相册名> 建立绑定规则，无规则时不会有任何上传行为"
+  },
+  "album_rules": {
+    "description": "相册绑定规则列表，每条格式：uid:群号:相册名或相册ID",
+    "type": "list",
+    "default": [],
+    "hint": "推荐用指令 微博相册绑定 / 微博相册移除 管理，此处仅作查看与手工调整"
+  },
+  "album_max_images": {
+    "description": "单条微博最多处理的图片数（消息带图与相册上传共用上限）",
+    "type": "int",
+    "default": 9
+  },
+  "album_download_concurrency": {
+    "description": "相册图片下载并发数",
+    "type": "int",
+    "default": 5,
+    "hint": "下载走微博 CDN，可以多路一起；小机器带宽差或容易被风控时再调低"
+  },
+  "album_upload_concurrency": {
+    "description": "相册图片上传并发数",
+    "type": "int",
+    "default": 3,
+    "hint": "NapCat 传相册是每张内部串行发 16KB 分片，单张本身就慢，并发数基本等于吞吐；调到 1 就是逐张排队"
+  },
+  "album_upload_interval": {
+    "description": "相邻两张图片上传之间的间隔（秒），防 QQ 相册频控",
+    "type": "float",
+    "default": 0.5,
+    "hint": "每张传完占着并发槽歇这么再让位。撞频控（网关报错）时先调大这个，其次才调低并发数"
+  },
+  "album_upload_payload_mb": {
+    "description": "同时在途的上传载荷总量预算（MB，按原图体积计），0 表示不限制",
+    "type": "int",
+    "default": 32,
+    "hint": "小内存服务器的硬顶：超大原图会自动把并发压到串行"
+  },
+  "album_same_host": {
+    "description": "AstrBot 与 NapCat 部署在同一台机器（共享文件系统）时开启",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后优先用本地路径传图（相册内保留微博图片名且省内存），失败自动降级 base64；相册文件名回读去重也只在这一档开启时做——base64 载荷下 NapCat 会把文件改名，相册里的文件名不含微博 pid"
+  },
+  "album_live_gif": {
+    "description": "实况图（livephoto）转 GIF 上传",
+    "type": "bool",
+    "default": true,
+    "hint": "需要服务器安装 ffmpeg；未安装或转换失败时自动改传封面静图"
+  },
+  "album_notify": {
+    "description": "图片上传完成后在群里发一条结果提示",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时静默上传，仅记录日志"
   },
   "push_delay_seconds": {
     "description": "多条推送消息之间的间隔秒数（防刷屏与QQ风控）",

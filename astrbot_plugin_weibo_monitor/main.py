@@ -2,22 +2,34 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import html as html_lib
 import ipaddress
 import json
 import random
 import re
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, StarTools
+
+from .napcat_album import (
+    ALBUM_LIST_ITEM_ID_KEYS,
+    ALBUM_LIST_ITEM_NAME_KEYS,
+    MEDIA_NAME_KEYS,
+    NapCatAlbum,
+    NapCatError,
+    pick,
+)
 
 PLUGIN_NAME = "astrbot_plugin_weibo_monitor"
 
@@ -36,6 +48,15 @@ WEIBO_VISITOR_REFERER = (
 
 # 出网白名单：微博时间线/全文接口 + 微博游客身份系统
 WEIBO_ALLOWED_HOSTS = {"m.weibo.cn", "visitor.passport.weibo.cn"}
+
+# 相册媒体下载白名单（与 API 白名单分离）：图片 CDN + 实况图视频段 CDN
+MEDIA_ALLOWED_SUFFIXES = (
+    ".sinaimg.cn",
+    ".weibocdn.com",
+    ".weibocdn.me",
+    ".weibo.com",
+    ".weibo.cn",
+)
 
 # UA 池：游客身份与 UA 绑定（一套身份一套指纹），全部为移动端 UA。
 # 第一个为实测验证过的 UA。
@@ -61,19 +82,42 @@ PENDING_HARD_LIMIT = 100
 MIN_INTERVAL_SECONDS = 30
 # show_full_weibo_text 开启时全文的安全上限（防超长文本刷屏/QQ 风控）
 FULL_TEXT_MAX_CHARS = 2000
-VISITOR_MAX_AGE = 3 * 24 * 3600   # 游客身份最长复用 3 天，到期主动换新
-RENEW_COOLDOWN = 600.0            # 主动续期最小间隔（秒）：频繁 genvisitor 本身是风控信号
-RENEW_MAX_PER_HOUR = 3            # 每小时最多续期尝试次数
-RENEW_FAIL_BACKOFF = 600.0        # 续期失败退避基数（秒），指数递增，封顶 1 小时
-REQUEST_GAP = (2.0, 5.0)          # 相邻两次微博请求的最小随机间隔（秒）
+VISITOR_MAX_AGE = 3 * 24 * 3600  # 游客身份最长复用 3 天，到期主动换新
+RENEW_COOLDOWN = 600.0  # 主动续期最小间隔（秒）：频繁 genvisitor 本身是风控信号
+RENEW_MAX_PER_HOUR = 3  # 每小时最多续期尝试次数
+RENEW_FAIL_BACKOFF = 600.0  # 续期失败退避基数（秒），指数递增，封顶 1 小时
+REQUEST_GAP = (2.0, 5.0)  # 相邻两次微博请求的最小随机间隔（秒）
 # HTTP 418/432 属于 IP 级风控：全局冷却梯度（秒），触发后暂停所有微博请求
 RISK_COOLDOWN_STEPS = (600, 1800, 3600)
 # 距上次风控触发超过该时长后冷却梯度重置，避免历史偶发触发导致永久 60 分钟冷却
 RISK_ESCALATION_RESET = 2 * 3600
 
+# ---------------- 群相册自动上传 ----------------
+DEFAULT_MAX_IMAGES = 9  # 单条微博最多处理的图片数（消息带图与相册上传共用上限）
+IMG_MAX_BYTES = 30 * 1024 * 1024  # 单张图片/实况图视频段的下载体积上限
+DISK_FLOOR_MB = 1024  # 批次下载前要求临时目录所在盘至少剩余空间（MB），防写满磁盘
+ALBUM_TMP_DIR = "album_tmp"  # 相册上传的临时下载目录（插件数据目录下），传完即删
+ALBUM_RESOLVE_TTL = 3600.0  # (群, 相册) 解析结果的内存缓存时长（秒）
+LEDGER_TTL = 30 * 86400  # "这张图传过"台账保留时长（与上游相册插件口径一致）
+LEDGER_MAX = 2000  # 每个相册最多记多少条台账
+BAD_NAME_RE = re.compile(r'[\\/:*?"<>|\s]+')
+SINAIMG_RE = re.compile(
+    r"(https?:)?//([a-z0-9]+)\.sinaimg\.cn/([a-z0-9]+)/([0-9a-zA-Z]+)\.(\w+)", re.I
+)
+
 _MONTH_MAP = {
-    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
 }
 _TZ_CN = timezone(timedelta(hours=8))
 _STD_TIME_RE = re.compile(
@@ -94,6 +138,10 @@ USAGE = (
     "微博添加 <uid或主页链接> - 添加监控账号（管理员）\n"
     "微博删除 <uid> - 取消监控（管理员）\n"
     "微博列表 - 查看监控账号与推送目标\n"
+    "微博相册绑定 <uid> <相册名或ID> - 该博主的微博图片自动上传到本群相册（管理员）\n"
+    "微博相册移除 <uid> - 解除博主的相册绑定（管理员）\n"
+    "微博相册列表 - 查看所有相册绑定规则\n"
+    "微博列相册 - 查看本群的相册列表（管理员）\n"
     "微博检测 - 立即检查一轮（管理员）\n"
     "微博状态 - 查看运行状态"
 )
@@ -138,8 +186,13 @@ def _parse_created_epoch(raw: str) -> float:
         return 0.0
     try:
         dt = datetime(
-            int(m.group(7)), _MONTH_MAP[m.group(2)], int(m.group(3)),
-            int(m.group(4)), int(m.group(5)), int(m.group(6)), tzinfo=_TZ_CN,
+            int(m.group(7)),
+            _MONTH_MAP[m.group(2)],
+            int(m.group(3)),
+            int(m.group(4)),
+            int(m.group(5)),
+            int(m.group(6)),
+            tzinfo=_TZ_CN,
         )
         return dt.timestamp()
     except ValueError:
@@ -155,7 +208,7 @@ def _format_time(raw: str) -> str:
     if m and m.group(2) in _MONTH_MAP:
         year, mon, day = m.group(7), _MONTH_MAP[m.group(2)], int(m.group(3))
         ymd = f"{year}-{mon:02d}-{day:02d}"
-        if year != str(datetime.now().year):
+        if year != str(datetime.now(tz=_TZ_CN).year):
             return f"{ymd} {m.group(4)}:{m.group(5)}"
         return f"{mon:02d}-{day:02d} {m.group(4)}:{m.group(5)}"
     return raw
@@ -172,6 +225,15 @@ def _extract_uid(text: str) -> str | None:
     return None
 
 
+def _redact_proxy(url: str) -> str:
+    """抹掉代理里的 user:pass@，proxy 可能带凭据而 微博状态 不做权限校验。"""
+    parsed = urlparse(url)
+    if not (parsed.username or parsed.password):
+        return url
+    host = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunparse(parsed._replace(netloc=f"***@{host}"))
+
+
 def _jsonp_data(body: str) -> dict[str, Any] | None:
     """解析 gen_callback({...}) / cross_domain({...}) 之类的 JSONP 响应。"""
     m = _JSONP_RE.search((body or "").strip())
@@ -181,6 +243,137 @@ def _jsonp_data(body: str) -> dict[str, Any] | None:
         return json.loads(m.group(1))
     except json.JSONDecodeError:
         return None
+
+
+def to_original(url: str) -> str:
+    """把任意 sinaimg 缩略图地址改写成 /large/ 原图地址。"""
+    url = (url or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("http://"):
+        url = "https://" + url[len("http://") :]
+    m = SINAIMG_RE.search(url)
+    if not m:
+        return url
+    scheme = url[: m.start()] if url[: m.start()].endswith("://") else "https://"
+    token, pid, ext = m.group(3), m.group(4), m.group(5)
+    if token in ("large", "original"):
+        return url
+    return f"{scheme}{m.group(2)}.sinaimg.cn/large/{pid}.{ext}"
+
+
+def to_light(url: str) -> str:
+    """把任意 sinaimg 地址改写成 /mw2000/ 轻量档（长边 2000px），仅供推送消息带图。
+
+    消息里的图是 NapCat 自己去 sina CDN 抓的：/large/ 原图单张 5~30MB，九张串在
+    一条消息里很容易顶穿 message_send_timeout，超时又按"发送失败"进重试，结果同一条
+    微博在群里重复出现。mw2000 是微博 CDN 原生档位，改一个路径段就有，不需要本地
+    下载也不需要压缩。群相册那条仍然用 /large/ 原图，本函数不影响它。
+    """
+    url = (url or "").strip()
+    m = SINAIMG_RE.search(url)
+    if not m:
+        return url
+    return f"https://{m.group(2)}.sinaimg.cn/mw2000/{m.group(4)}.{m.group(5)}"
+
+
+def _pic_nodes(mb: dict[str, Any]) -> list[dict[str, Any]]:
+    """兼容两种结构：m.weibo.cn 的 mblog.pics 与桌面端 ajax 的 pic_infos。"""
+    pics = mb.get("pics")
+    if isinstance(pics, list) and pics:
+        return [p for p in pics if isinstance(p, dict)]
+    infos = mb.get("pic_infos")
+    if isinstance(infos, dict) and infos:
+        out: list[dict[str, Any]] = []
+        for pid in mb.get("pic_ids") or list(infos):
+            entry = infos.get(pid)
+            if isinstance(entry, dict):
+                merged = dict(entry)
+                merged.setdefault("pid", pid)
+                out.append(merged)
+        return out
+    return []
+
+
+def _extract_pics(
+    mb: dict[str, Any], rt_mb: dict[str, Any] | None = None
+) -> list[dict[str, str]]:
+    """从 mblog 提取图片列表（转发微博时原微博的图也算），纯视频条目跳过。
+
+    每项：{"pid","url"(改写后的 /large/ 原图),"alt_url"(接口原地址，原图 404 时兜底),
+    "ext","kind","video_url"}；kind: pic 普通图 / live 实况图（video_url 为视频段）。
+    """
+    imgs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for node in (mb, rt_mb):
+        if not node:
+            continue
+        for p in _pic_nodes(node):
+            largest = p.get("largest") or {}
+            large = p.get("large") or {}
+            base = (
+                largest.get("url")
+                or large.get("url")
+                or (p.get("original") or {}).get("url")
+                or p.get("url")
+                or ""
+            )
+            if not base:
+                continue
+            seg = str(base).split("?")[0].rstrip("/").split("/")
+            pid = str(p.get("pid") or "")
+            if not pid:
+                # 接口缺 pid 时从 URL 提取：sinaimg 路径是 /<尺寸token>/<pid>.<ext>，
+                # 文件名主干才是 pid（取 seg[-2] 会拿到 "large" 这类尺寸段，
+                # 整批图共享同一个 pid，去重会把多张压成一张、本地文件互相覆盖）
+                pid = seg[-1].rsplit(".", 1)[0] if seg and "." in seg[-1] else ""
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            ptype = str(p.get("type") or "")
+            if ptype == "video":
+                continue  # 群相册接口仅支持图片，纯视频条目不处理
+            ext = (seg[-1].rsplit(".", 1)[-1] if "." in seg[-1] else "jpg").lower()
+            video = str(p.get("videoSrc") or p.get("video_src") or "")
+            kind = "live" if (ptype == "livephoto" and video) else "pic"
+            orig = to_original(str(base))
+            imgs.append(
+                {
+                    "pid": pid,
+                    "url": orig,
+                    "alt_url": "" if orig == str(base) else str(base),
+                    "ext": ext,
+                    "kind": kind,
+                    "video_url": video if kind == "live" else "",
+                }
+            )
+    return imgs
+
+
+def _pic_stem(pic: dict[str, str]) -> str:
+    """本地文件名主干：必须用整串 pid（同一博主多张图的 pid 前缀可能完全相同）。"""
+    pid = str(pic.get("pid") or "")
+    if pid:
+        return BAD_NAME_RE.sub("", pid)[:64] or "pic"
+    return hashlib.sha1(str(pic.get("url") or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _mark(pic: dict[str, str]) -> str:
+    """相册里的稳定标识：整串 pid（或 URL 摘要），用来判断"这张已经传过"。"""
+    return _pic_stem(pic).lower()
+
+
+def _parse_album_rules(raw_rules) -> dict[tuple[str, str], str]:
+    """album_rules 配置列表 → {(uid, 群号): 相册名或ID}，条目格式 uid:群号:相册。"""
+    rules: dict[tuple[str, str], str] = {}
+    for item in raw_rules or []:
+        parts = str(item).strip().split(":", 2)
+        if len(parts) != 3:
+            continue
+        uid, gid, album = (p.strip() for p in parts)
+        if uid.isdigit() and gid.isdigit() and album:
+            rules[(uid, gid)] = album
+    return rules
 
 
 class WeiboMonitorPlugin(Star):
@@ -224,6 +417,21 @@ class WeiboMonitorPlugin(Star):
         # 待推送队列: [{"post_id","uid","text","created_ts","retries"}]
         self.pending: list[dict[str, Any]] = []
         self.last_check_ts = 0.0
+        # ---- 群相册自动上传 ----
+        self._album_tasks: set[asyncio.Task] = set()
+        # 上传并发闸 + 在途 base64 载荷字节预算（配置热改时重建）
+        self._up_sem: asyncio.Semaphore | None = None
+        self._up_conc = 0
+        self._up_bytes = 0
+        self._up_cond: asyncio.Condition | None = None
+        self._dl_sem: asyncio.Semaphore | None = None
+        self._dl_conc = 0
+        self._cpu_sem = asyncio.Semaphore(2)  # ffmpeg 转码这类重 CPU 活的全局闸
+        self._album_locks: dict[str, asyncio.Lock] = {}  # 同群批次串行化
+        # (群, 相册标识) -> (时间戳, album_id, album_name)
+        self._album_cache: dict[str, tuple[float, str, str]] = {}
+        self._self_ids: dict[int, str] = {}  # id(bot) -> 登录账号 self_id 缓存
+        self._ffmpeg = ""  # ffmpeg 可执行文件路径，initialize 时探测
 
     # ---------------- 生命周期 ----------------
 
@@ -231,16 +439,23 @@ class WeiboMonitorPlugin(Star):
         self._data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self._load_state()
         self._sync_accounts_from_config()
+        # 实况图转 GIF 依赖 ffmpeg（缺失时回落封面静图，不影响其余功能）
+        self._ffmpeg = shutil.which("ffmpeg") or ""
+        if not self._ffmpeg:
+            logger.info(f"{PLUGIN_NAME} 未找到 ffmpeg，实况图将只上传封面静图")
+        # 清掉上次运行残留的下载临时文件（正常流程传完即删，这里只兜底）
+        await asyncio.to_thread(self._wipe_album_tmp)
         # DummyCookieJar：cookie 全部手工管理，避免与 jar 自动附带冲突
         self._http = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar())
         proxy = str(self.config.get("proxy") or "").strip()
         if proxy:
             if proxy.startswith(("http://", "https://")):
                 self._proxy = proxy
-                logger.info(f"{PLUGIN_NAME} 使用代理出网: {proxy}")
+                logger.info(f"{PLUGIN_NAME} 使用代理出网: {_redact_proxy(proxy)}")
             else:
                 logger.warning(
-                    f"{PLUGIN_NAME} proxy 配置无效（需 http:// 或 https:// 开头），已忽略: {proxy}"
+                    f"{PLUGIN_NAME} proxy 配置无效（需 http:// 或 https:// 开头），"
+                    f"已忽略: {_redact_proxy(proxy)}"
                 )
         # 自定义 Cookie 模式：直接使用用户身份，跳过游客身份的预热与续期
         self._custom_cookies = self._parse_cookie_string(
@@ -270,10 +485,17 @@ class WeiboMonitorPlugin(Star):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._poll_task
             self._poll_task = None
+        # 相册上传是独立任务，要在关掉 HTTP 会话之前撤掉（在途下载引用着 session）
+        for task in list(self._album_tasks):
+            task.cancel()
+        if self._album_tasks:
+            await asyncio.gather(*self._album_tasks, return_exceptions=True)
+            self._album_tasks.clear()
         self._save_state()
         if self._http and not self._http.closed:
             await self._http.close()
         self._http = None
+        await asyncio.to_thread(self._wipe_album_tmp)
         logger.info(f"{PLUGIN_NAME} 已停止")
 
     # ---------------- 配置与状态 ----------------
@@ -286,6 +508,13 @@ class WeiboMonitorPlugin(Star):
             return max(0, int(self.config.get(key) or default))
         except (TypeError, ValueError):
             return default
+
+    def _float_cfg(self, key: str, default: float) -> float:
+        try:
+            v = float(self.config.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+        return v if v >= 0 else default
 
     def _message_format(self) -> str:
         return str(self.config.get("message_format") or DEFAULT_MESSAGE_FORMAT).replace(
@@ -344,6 +573,9 @@ class WeiboMonitorPlugin(Star):
             if isinstance(item, dict) and item.get("post_id") and item.get("text"):
                 item.setdefault("retries", 0)
                 item.setdefault("created_ts", 0.0)
+                # v1.4.0 起待推送条目携带图片信息，旧状态文件没有该字段
+                if not isinstance(item.get("pics"), list):
+                    item["pics"] = []
                 pending.append(item)
         self.pending = pending[-PENDING_HARD_LIMIT:]
         self.last_check_ts = float(state.get("last_check_ts") or 0)
@@ -428,9 +660,13 @@ class WeiboMonitorPlugin(Star):
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
 
-    async def _get_text(self, url: str, params: dict[str, Any],
-                        headers: dict[str, str],
-                        collect: dict[str, str] | None = None) -> str:
+    async def _get_text(
+        self,
+        url: str,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        collect: dict[str, str] | None = None,
+    ) -> str:
         await self._validate_url(url)
         await self._pace()
         assert self._http is not None
@@ -439,7 +675,10 @@ class WeiboMonitorPlugin(Star):
         for attempt in range(3):
             try:
                 async with self._http.get(
-                    url, params=params, headers=headers, timeout=timeout,
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=timeout,
                     proxy=self._proxy,
                 ) as resp:
                     if resp.status in (418, 432):
@@ -456,8 +695,9 @@ class WeiboMonitorPlugin(Star):
                     await asyncio.sleep(1.5 * (2**attempt))
         raise WeiboFetchError(f"请求失败: {last_err}")
 
-    async def _api_get(self, url: str, params: dict[str, Any],
-                       referer: str | None = None) -> dict[str, Any]:
+    async def _api_get(
+        self, url: str, params: dict[str, Any], referer: str | None = None
+    ) -> dict[str, Any]:
         """GET m.weibo.cn JSON 接口。
 
         ok=-100（游客身份过期）→ 换新身份重试一次；
@@ -487,8 +727,9 @@ class WeiboMonitorPlugin(Star):
                 await self._renew_visitor(force=True)
         raise WeiboFetchError("unreachable")  # pragma: no cover
 
-    async def _api_get_once(self, url: str, params: dict[str, Any],
-                            referer: str | None) -> dict[str, Any]:
+    async def _api_get_once(
+        self, url: str, params: dict[str, Any], referer: str | None
+    ) -> dict[str, Any]:
         if self._http is None:
             raise WeiboFetchError("HTTP 会话未初始化")
         headers = self._base_headers()
@@ -504,9 +745,7 @@ class WeiboMonitorPlugin(Star):
             xsrf = cookies.get("XSRF-TOKEN", "")
             if xsrf:
                 headers["X-Xsrf-Token"] = xsrf
-        headers["Cookie"] = "; ".join(
-            f"{k}={v}" for k, v in cookies.items()
-        )
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
         body = await self._get_text(url, params, headers)
         try:
             data = json.loads(body)
@@ -564,8 +803,9 @@ class WeiboMonitorPlugin(Star):
         """启动预热：带现有身份访问一次主页，刷新 _T_WM/XSRF-TOKEN 等指纹 cookie。"""
         try:
             cookies: dict[str, str] = {}
-            await self._get_text(WEIBO_HOME_URL, {}, self._base_headers(),
-                                 collect=cookies)
+            await self._get_text(
+                WEIBO_HOME_URL, {}, self._base_headers(), collect=cookies
+            )
             if cookies:
                 self._visitor_cookies.update(cookies)
                 self._save_state()
@@ -595,7 +835,7 @@ class WeiboMonitorPlugin(Star):
             if now < self._renew_fail_until:
                 raise WeiboFetchError(
                     "上次续期失败，退避中："
-                    f"{datetime.fromtimestamp(self._renew_fail_until).strftime('%H:%M:%S')} 后自动重试"
+                    f"{datetime.fromtimestamp(self._renew_fail_until, tz=_TZ_CN).strftime('%H:%M:%S')} 后自动重试"
                 )
             if (
                 not force
@@ -609,9 +849,11 @@ class WeiboMonitorPlugin(Star):
                 await self._do_renew()
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
+            except Exception:
                 self._renew_fail_count += 1
-                backoff = min(3600.0, RENEW_FAIL_BACKOFF * (2 ** (self._renew_fail_count - 1)))
+                backoff = min(
+                    3600.0, RENEW_FAIL_BACKOFF * (2 ** (self._renew_fail_count - 1))
+                )
                 self._renew_fail_until = time.time() + backoff
                 raise
             self._renew_fail_count = 0
@@ -648,7 +890,9 @@ class WeiboMonitorPlugin(Star):
         )
         gen = _jsonp_data(body) or {}
         if gen.get("retcode") != 20000000:
-            raise WeiboFetchError(f"genvisitor 失败: {gen.get('retcode')} {gen.get('msg')}")
+            raise WeiboFetchError(
+                f"genvisitor 失败: {gen.get('retcode')} {gen.get('msg')}"
+            )
         tid = str((gen.get("data") or {}).get("tid") or "")
         confidence = (gen.get("data") or {}).get("confidence", 90)
         if not tid:
@@ -665,8 +909,9 @@ class WeiboMonitorPlugin(Star):
             "from": "weibo",
             "_rand": f"{random.random():.17f}",
         }
-        await self._get_text(WEIBO_INCARNATE_URL, inc_params, visitor_headers,
-                             collect=cookies)
+        await self._get_text(
+            WEIBO_INCARNATE_URL, inc_params, visitor_headers, collect=cookies
+        )
 
         if "SUB" not in cookies:
             raise WeiboAuthError("游客身份获取失败（未拿到 SUB）")
@@ -795,7 +1040,9 @@ class WeiboMonitorPlugin(Star):
             return True
         return False
 
-    def _parse_post(self, mb: dict[str, Any], fallback_uid: str) -> dict[str, Any] | None:
+    def _parse_post(
+        self, mb: dict[str, Any], fallback_uid: str
+    ) -> dict[str, Any] | None:
         pid = str(mb.get("id") or mb.get("mid") or "").strip()
         if not pid:
             return None
@@ -809,13 +1056,14 @@ class WeiboMonitorPlugin(Star):
         orig_name, orig_text, orig_id = "", "", ""
         orig_is_long = False
         is_retweet = "retweeted_status" in mb
+        rt_mb: dict[str, Any] | None = None
         if is_retweet:
-            rt = mb.get("retweeted_status") or {}
-            rt_user = rt.get("user") or {}
+            rt_mb = mb.get("retweeted_status") or {}
+            rt_user = rt_mb.get("user") or {}
             orig_name = str(rt_user.get("screen_name") or "")
-            orig_text = _clean_text(str(rt.get("text") or ""), limit)
-            orig_id = str(rt.get("id") or rt.get("mid") or "")
-            orig_is_long = bool(rt.get("isLongText"))
+            orig_text = _clean_text(str(rt_mb.get("text") or ""), limit)
+            orig_id = str(rt_mb.get("id") or rt_mb.get("mid") or "")
+            orig_is_long = bool(rt_mb.get("isLongText"))
 
         return {
             "id": pid,
@@ -830,6 +1078,7 @@ class WeiboMonitorPlugin(Star):
             "orig_text": orig_text,
             "orig_id": orig_id,
             "orig_is_long": orig_is_long,
+            "pics": _extract_pics(mb, rt_mb),
         }
 
     def _post_body(self, post: dict[str, Any]) -> str:
@@ -850,8 +1099,11 @@ class WeiboMonitorPlugin(Star):
             kw = str(kw).strip()
             if kw and kw in text:
                 return f"包含屏蔽词“{kw}”"
-        whitelist = [str(k).strip() for k in (self.config.get("whitelist_keywords") or [])
-                     if str(k).strip()]
+        whitelist = [
+            str(k).strip()
+            for k in (self.config.get("whitelist_keywords") or [])
+            if str(k).strip()
+        ]
         if whitelist and not any(kw in text for kw in whitelist):
             return "未包含任何白名单关键词"
         return None
@@ -961,6 +1213,10 @@ class WeiboMonitorPlugin(Star):
         if not new_posts:
             return 0
         include_rt = bool(self.config.get("include_retweets", True))
+        # 图片数上限：消息带图与相册上传共用（0/异常值回退默认）
+        max_imgs = (
+            self._int_cfg("album_max_images", DEFAULT_MAX_IMAGES) or DEFAULT_MAX_IMAGES
+        )
         for post in reversed(new_posts):  # 旧→新依次入队
             seen.add(post["id"])
             if self._is_expired(post.get("created_ts", 0.0)):
@@ -981,24 +1237,34 @@ class WeiboMonitorPlugin(Star):
                     "text": self._build_message(post),
                     "created_ts": post.get("created_ts", 0.0),
                     "retries": 0,
+                    "pics": (post.get("pics") or [])[:max_imgs],
                 }
             )
         info["seen_ids"] = list(seen)[-SEEN_IDS_LIMIT:]
         return len(new_posts)
 
-    async def _send_with_timeout(self, session: str, text: str) -> bool:
+    def _build_chain(self, item: dict[str, Any]) -> MessageChain:
+        """构建推送消息链：文本 + 可选图片段（message_with_images 开启时）。"""
+        chain = MessageChain().message(item["text"])
+        if bool(self.config.get("message_with_images", True)):
+            for pic in item.get("pics") or []:
+                url = str(pic.get("url") or "")
+                if url:
+                    # 轻量档：群里看够了，原图交给相册那条路
+                    chain.chain.append(Image.fromURL(to_light(url)))
+        return chain
+
+    async def _send_with_timeout(self, session: str, chain: MessageChain) -> bool:
         """带超时的主动消息发送，防止单个适配器卡死拖住整个轮询任务。"""
         send_timeout = self._int_cfg("message_send_timeout", 60)
         try:
             if send_timeout > 0:
                 ok = await asyncio.wait_for(
-                    self.context.send_message(session, MessageChain().message(text)),
+                    self.context.send_message(session, chain),
                     timeout=send_timeout,
                 )
             else:
-                ok = await self.context.send_message(
-                    session, MessageChain().message(text)
-                )
+                ok = await self.context.send_message(session, chain)
             if ok is False:
                 raise RuntimeError("AstrBot 未找到匹配的消息平台")
             return True
@@ -1026,16 +1292,20 @@ class WeiboMonitorPlugin(Star):
                 logger.warning(f"推送重试超限，放弃微博 {item['post_id']}")
                 continue
             sent = False
+            sent_sessions: list[str] = []
+            chain = self._build_chain(item)
             for session in sessions:
                 try:
-                    if await self._send_with_timeout(session, item["text"]):
+                    if await self._send_with_timeout(session, chain):
                         sent = True
+                        sent_sessions.append(session)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     logger.warning(f"推送到 {session} 失败: {e!r}")
             if sent:
                 logger.info(f"已推送微博 {item['post_id']}")
+                self._dispatch_album_uploads(item, sent_sessions)
             else:
                 item["retries"] = item.get("retries", 0) + 1
                 remaining.append(item)
@@ -1045,6 +1315,587 @@ class WeiboMonitorPlugin(Star):
         if not sessions and len(remaining) > PENDING_HARD_LIMIT:
             remaining = remaining[-PENDING_HARD_LIMIT:]
         self.pending = remaining
+
+    # ---------------- 群相册自动上传 ----------------
+
+    def _album_tmp_root(self) -> Path:
+        assert self._data_dir is not None
+        return self._data_dir / ALBUM_TMP_DIR
+
+    def _wipe_album_tmp(self):
+        """清掉上次运行残留的下载临时文件（正常流程传完即删，这里只兜底）。"""
+        shutil.rmtree(self._album_tmp_root(), ignore_errors=True)
+
+    def _album_rules(self) -> dict[tuple[str, str], str]:
+        return _parse_album_rules(self.config.get("album_rules"))
+
+    @staticmethod
+    def _parse_umo(umo: str) -> tuple[str, str, str]:
+        """拆 unified_msg_origin：platform_id:message_type:session_id。"""
+        parts = (umo or "").split(":", 2)
+        if len(parts) != 3:
+            return "", "", ""
+        return parts[0], parts[1], parts[2]
+
+    def _dispatch_album_uploads(self, item: dict[str, Any], sent_sessions: list[str]):
+        """转发成功后按规则派发相册上传任务：每个命中规则的群一个异步任务。
+
+        触发语义与"转发后上传"一致：只有该群真的推送成功才上传。任务不 await，
+        不阻塞轮询循环；登记进 _album_tasks 供 terminate 撤销。
+        """
+        if not bool(self.config.get("album_enabled", True)):
+            return
+        pics = item.get("pics") or []
+        uid = str(item.get("uid") or "")
+        if not pics or not uid:
+            return
+        rules = self._album_rules()
+        if not rules:
+            return
+        hit_any = False
+        for session in sent_sessions:
+            platform, msg_type, sid = self._parse_umo(session)
+            if msg_type != "GroupMessage" or not sid:
+                continue
+            want = rules.get((uid, sid))
+            if not want:
+                continue
+            hit_any = True
+            task = asyncio.create_task(
+                self._album_upload_task(session, platform, sid, dict(item), want)
+            )
+            self._album_tasks.add(task)
+            task.add_done_callback(self._album_tasks.discard)
+        if hit_any:
+            logger.info(f"微博 {item['post_id']} 命中相册绑定规则，开始自动上传图片")
+
+    def _find_bot(self, platform_id: str):
+        """按 umo 的 platform_id 找 aiocqhttp 适配器实例的 CQHttp bot。
+
+        监控插件是轮询型，手里没有消息事件，只能从 platform_manager 拿适配器实例
+        （aiocqhttp 适配器把 OneBot 客户端挂在 .bot 上）。匹配不到 id 时退而取
+        第一个带 bot 的实例，兼容老版本 AstrBot 的元数据缺 id 的情况。
+        """
+        pm = getattr(self.context, "platform_manager", None)
+        get_insts = getattr(pm, "get_insts", None)
+        if not callable(get_insts):
+            return None
+        for inst in get_insts():
+            try:
+                meta = getattr(inst, "metadata", None)
+                if meta is None and hasattr(inst, "meta"):
+                    meta = inst.meta()
+                inst_id = str(getattr(meta, "id", "") or "")
+            except Exception:
+                continue
+            if inst_id and platform_id and inst_id != platform_id:
+                continue
+            bot = getattr(inst, "bot", None)
+            if bot is not None:
+                return bot
+        return None
+
+    async def _album_client(self, platform_id: str) -> NapCatAlbum:
+        """构造走 AstrBot 已有 OneBot 连接的相册客户端（地址与 token 全归适配器管）。"""
+        bot = self._find_bot(platform_id)
+        if bot is None:
+            raise NapCatError(
+                f"未找到平台 {platform_id or '(未知)'} 的 aiocqhttp 连接，无法上传群相册"
+            )
+        self_id = self._self_ids.get(id(bot))
+        if self_id is None:
+            try:
+                info = await bot.call_action("get_login_info")
+                self_id = str((info or {}).get("user_id") or "")
+            except Exception as e:
+                # 拿不到 self_id 不影响上传（多号同连一个协议端时才需要）
+                logger.info(
+                    f"{PLUGIN_NAME} 获取机器人登录信息失败（不影响上传）: {e!r}"
+                )
+                self_id = ""
+            self._self_ids[id(bot)] = self_id
+
+        async def caller(action: str, params: dict):
+            if self_id:
+                params["self_id"] = self_id
+            return await bot.call_action(action, **params)
+
+        try:
+            preferred = str(await self.get_kv_data("payload:same_host", "") or "")
+        except Exception:
+            preferred = ""
+        return NapCatAlbum(
+            caller,
+            preferred=preferred,
+            same_host=bool(self.config.get("album_same_host", False)),
+        )
+
+    @staticmethod
+    def _ledger_key(gid: str, album_id: str) -> str:
+        return f"sent:{gid}:{album_id}"
+
+    async def _sent_marks(self, gid: str, album_id: str) -> set[str]:
+        """本插件往这个相册传过哪些图（按 pid 记，KV 台账）。
+
+        base64 载荷会被 NapCat 改名成 randomUUID，相册里的文件名不再含微博 pid，
+        只靠回读文件名去重会失效，所以自己记一份。
+        """
+        try:
+            raw = await self.get_kv_data(self._ledger_key(gid, album_id), {}) or {}
+        except Exception as e:
+            logger.info(f"{PLUGIN_NAME} 读取上传台账失败，本次跳过台账去重: {e!r}")
+            return set()
+        now = time.time()
+        out: set[str] = set()
+        for m, ts in dict(raw).items():
+            try:
+                if now - float(ts) < LEDGER_TTL:
+                    out.add(m)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    async def _remember(self, gid: str, album_id: str, marks: list[str]) -> None:
+        if not marks:
+            return
+        key = self._ledger_key(gid, album_id)
+        try:
+            raw = dict(await self.get_kv_data(key, {}) or {})
+        except Exception:
+            raw = {}
+        now = time.time()
+        sent: dict[str, float] = {}
+        for m, ts in raw.items():
+            try:
+                t = float(ts)
+            except (TypeError, ValueError):
+                continue
+            if now - t < LEDGER_TTL:
+                sent[m] = t
+        sent.update(dict.fromkeys(marks, now))
+        if len(sent) > LEDGER_MAX:
+            sent = dict(sorted(sent.items(), key=lambda kv: kv[1])[-LEDGER_MAX:])
+        try:
+            await self.put_kv_data(key, sent)
+        except Exception as e:
+            # 台账写不进去只损失去重能力，不影响这次已经传上去的图
+            logger.warning(f"{PLUGIN_NAME} 写入上传台账失败: {e!r}")
+
+    async def _existing_names(self, nc: NapCatAlbum, gid: str, album_id: str) -> str:
+        """相册里已有媒体的文件名合集；读不到就返回空串（去重只是优化，不能成为故障点）。"""
+        try:
+            media = await nc.list_media(gid, album_id)
+        except NapCatError as e:
+            logger.info(f"{PLUGIN_NAME} 读取相册已有媒体失败，本次跳过文件名去重: {e}")
+            return ""
+        return " ".join(pick(m, MEDIA_NAME_KEYS) for m in media).lower()
+
+    async def _resolve_album_cached(
+        self, nc: NapCatAlbum, gid: str, want: str
+    ) -> tuple[str, str]:
+        """(群, 相册名/ID) -> (album_id, album_name)，命中缓存就不再翻相册列表。"""
+        key = f"{gid}:{want}"
+        hit = self._album_cache.get(key)
+        now = time.time()
+        if hit and now - hit[0] < ALBUM_RESOLVE_TTL:
+            return hit[1], hit[2]
+        album_id, album_name = await nc.resolve_album(gid, want)
+        self._album_cache[key] = (now, album_id, album_name)
+        return album_id, album_name
+
+    def _group_lock(self, gid: str) -> asyncio.Lock:
+        lock = self._album_locks.get(gid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._album_locks[gid] = lock
+        return lock
+
+    def _up_gate(self) -> asyncio.Semaphore:
+        """上传并发总闸（配置热改时重建，在途任务拿旧闸跑完本批）。"""
+        conc = max(1, self._int_cfg("album_upload_concurrency", 3))
+        if conc != self._up_conc or self._up_sem is None:
+            self._up_sem = asyncio.Semaphore(conc)
+            self._up_conc = conc
+        if self._up_cond is None:
+            # 字节预算 Condition 全程复用不重建：在途任务还挂着旧实例，
+            # 重建会把 _up_bytes 计数清零，预算就失真了
+            self._up_cond = asyncio.Condition()
+        return self._up_sem
+
+    def _dl_gate(self) -> asyncio.Semaphore:
+        """下载并发总闸。"""
+        conc = max(1, self._int_cfg("album_download_concurrency", 5))
+        if conc != self._dl_conc or self._dl_sem is None:
+            self._dl_sem = asyncio.Semaphore(conc)
+            self._dl_conc = conc
+        return self._dl_sem
+
+    async def _validate_media_url(self, url: str):
+        """媒体下载前校验：仅 http(s)、host 限微博系 CDN、DNS 不解析到内网/保留地址。"""
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise WeiboFetchError(f"拒绝非 http(s) 协议的媒体地址: {parsed.scheme}")
+        host = parsed.hostname or ""
+        if not any(
+            host == s.lstrip(".") or host.endswith(s) for s in MEDIA_ALLOWED_SUFFIXES
+        ):
+            raise WeiboFetchError(f"媒体 host 不在白名单内: {host}")
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await loop.getaddrinfo(host, None)
+        except OSError as e:
+            raise WeiboFetchError(f"媒体域名解析失败: {host} ({e})") from e
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_reserved
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_unspecified
+            ):
+                raise WeiboFetchError(f"媒体域名解析到受限地址，已拦截: {ip}")
+
+    async def _stream_to_file(self, url: str, dest: Path):
+        """流式下载到 dest（64KB 分块边下边写），超限中途抛错由调用方清理残件。"""
+        assert self._http is not None
+        headers = {
+            "User-Agent": self._ua or UA_POOL[0],
+            "Referer": "https://weibo.com/",
+        }
+        timeout = aiohttp.ClientTimeout(total=60)
+        got = 0
+        async with self._http.get(
+            url, headers=headers, timeout=timeout, proxy=self._proxy
+        ) as resp:
+            resp.raise_for_status()
+            ctype = str(resp.headers.get("Content-Type", "")).lower()
+            if "text/html" in ctype:
+                # 风控页与错误页照样回 200，体积也常常过 1KB：只按大小判成功的话，
+                # HTML 会被存成 .jpg 一路传进相册，问题要到很远的地方才爆
+                raise WeiboFetchError(f"拿到的是 HTML 页面（多半被风控拦了）: {url}")
+            with dest.open("wb") as fh:
+                async for chunk in resp.content.iter_chunked(65536):
+                    got += len(chunk)
+                    if got > IMG_MAX_BYTES:
+                        raise WeiboFetchError(
+                            f"单张媒体超过 {IMG_MAX_BYTES // 1048576}MB 上限"
+                        )
+                    fh.write(chunk)
+
+    async def _download_pic(self, pic: dict[str, str], dest: Path) -> Path:
+        """下载一张微博图：先取 /large/ 原图，失败退回接口给的原始地址。"""
+        last = ""
+        for url in (pic.get("url"), pic.get("alt_url")):
+            if not url:
+                continue
+            part = dest.with_name(dest.name + ".part")
+            try:
+                await self._validate_media_url(url)
+                await self._stream_to_file(url, part)
+            except WeiboFetchError as e:
+                last = str(e)
+                part.unlink(missing_ok=True)
+                continue
+            size = part.stat().st_size if part.is_file() else 0
+            if size > 1024:
+                part.replace(dest)
+                return dest
+            last = f"HTTP 响应过小（{size}B）"
+            part.unlink(missing_ok=True)
+        raise WeiboFetchError(
+            f"图片下载失败 {pic.get('pid') or pic.get('url')}: {last}"
+        )
+
+    async def _to_gif(self, mp4: Path, gif: Path) -> bool:
+        """实况图视频段转 GIF（限帧率压体积），失败返回 False 让上层回落封面静图。"""
+        # ffmpeg 的 lanczos 缩放是实打实的满核负载，全进程最多同时跑 2 个转码
+        async with self._cpu_sem:
+            proc = await asyncio.create_subprocess_exec(
+                self._ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(mp4),
+                "-vf",
+                "fps=10,scale=480:-2:flags=lanczos",
+                "-loop",
+                "0",
+                str(gif),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return False
+        return proc.returncode == 0 and gif.is_file() and gif.stat().st_size > 0
+
+    async def _live_gif(self, pic: dict[str, str], folder: Path) -> Path | None:
+        """下载实况图的视频段并转 GIF；任何一步失败返回 None，由上层回落封面。"""
+        stem = _pic_stem(pic)
+        mp4, gif = folder / f"{stem}.mp4", folder / f"{stem}.gif"
+        try:
+            await self._validate_media_url(pic.get("video_url") or "")
+            await self._stream_to_file(str(pic.get("video_url") or ""), mp4)
+        except WeiboFetchError:
+            mp4.unlink(missing_ok=True)
+            return None
+        try:
+            ok = await self._to_gif(mp4, gif)
+        except (OSError, ValueError) as e:
+            logger.info(f"{PLUGIN_NAME} 实况图转 GIF 失败，改用封面静图: {e!r}")
+            ok = False
+        mp4.unlink(missing_ok=True)
+        return gif if ok and gif.is_file() else None
+
+    async def _download_pics(
+        self, pics: list[dict[str, str]], folder: Path
+    ) -> list[tuple[dict[str, str], Path]]:
+        """整批并发下载到批次目录（实况图优先转 GIF，失败回落封面静图）。"""
+        free_mb = (
+            await asyncio.to_thread(
+                lambda: shutil.disk_usage(self._album_tmp_root()).free
+            )
+        ) // 1048576
+        if free_mb < DISK_FLOOR_MB:
+            raise WeiboFetchError(
+                f"临时目录所在磁盘仅剩 {free_mb}MB（低于 {DISK_FLOOR_MB}MB 保护线），"
+                "已取消本批下载"
+            )
+        sem = self._dl_gate()
+        want_gif = bool(self.config.get("album_live_gif", True)) and bool(self._ffmpeg)
+
+        async def one(pic: dict[str, str]) -> tuple[dict[str, str], Path] | None:
+            async with sem:
+                if pic.get("kind") == "live" and want_gif and pic.get("video_url"):
+                    gif = await self._live_gif(pic, folder)
+                    if gif is not None:
+                        return pic, gif
+                ext = (
+                    re.sub(r"[^0-9a-z]", "", (pic.get("ext") or "jpg").lower())[:5]
+                    or "jpg"
+                )
+                path = folder / f"{_pic_stem(pic)}.{ext}"
+                try:
+                    await self._download_pic(pic, path)
+                except WeiboFetchError as e:
+                    logger.info(f"相册图片下载失败，跳过: {e}")
+                    return None
+                return pic, path
+
+        results = await asyncio.gather(*(one(p) for p in pics), return_exceptions=True)
+        files: list[tuple[dict[str, str], Path]] = []
+        for pic, r in zip(pics, results, strict=True):
+            if isinstance(r, BaseException):
+                # 子任务被撤（热重载/关停）时也按跳过收下，别让 CancelledError
+                # 从 gather 里穿出去把父任务一起带走
+                logger.warning(f"相册图片下载异常，跳过: {r!r}")
+            elif r is not None:
+                files.append(r)
+        return files
+
+    def _batch_dir(self, gid: str, post_id: str) -> Path:
+        """批次下载目录：目录名带群号与微博 id，群与群、批与批互不覆盖。"""
+        base = (
+            f"{BAD_NAME_RE.sub('', gid)[:24] or 'group'}_"
+            f"{BAD_NAME_RE.sub('', post_id)[:24] or 'post'}_"
+            f"{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+        folder = self._album_tmp_root() / base
+        seq = 1
+        while folder.exists():
+            seq += 1
+            folder = self._album_tmp_root() / f"{base}_{seq}"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    async def _upload_files(
+        self,
+        nc: NapCatAlbum,
+        gid: str,
+        album_id: str,
+        album_name: str,
+        files: list[tuple[dict[str, str], Path]],
+    ) -> tuple[int, list[str], list[str]]:
+        """并发上传一批本地文件，返回 (成功数, 失败明细, 成功 marks)。"""
+        sem = self._up_gate()
+        cond = self._up_cond
+        # NapCat 传相册是"每张内部串行发 16KB 分片"，单张本身就慢，并发数就是吞吐；
+        # 间隔只用来错开起点防撞频控，压得太狠就是纯等
+        interval = self._float_cfg("album_upload_interval", 0.5)
+        # 在途 base64 载荷字节预算：按 1.5 倍原图体积收紧（载荷在插件与 NapCat
+        # 两侧各驻留一份编码串）；单张超预算的图在空闸时照常放行，不会死锁
+        budget_mb = self._float_cfg("album_upload_payload_mb", 32.0)
+        payload_budget = (
+            float("inf") if budget_mb <= 0 else max(0.5, budget_mb) * 1048576 / 1.5
+        )
+        modes: dict[str, int] = {}
+
+        async def push(pic: dict[str, str], path: Path):
+            async with sem:
+                size = path.stat().st_size
+                async with cond:
+                    while self._up_bytes and self._up_bytes + size > payload_budget:
+                        await cond.wait()
+                    self._up_bytes += size
+                try:
+                    try:
+                        mode = await nc.upload_file(gid, album_id, album_name, path)
+                    except (NapCatError, OSError) as e:
+                        logger.warning(f"{PLUGIN_NAME} 相册上传失败 {_mark(pic)}: {e}")
+                        return None, f"{_mark(pic)}：{e}"
+                    if interval:
+                        # 传完占着并发槽歇 interval 再让位：只错开起点的话，
+                        # 槽位一空就放行，配置里的频控间隔会名存实亡
+                        await asyncio.sleep(interval)
+                    return mode or "ok", None
+                finally:
+                    async with cond:
+                        self._up_bytes -= size
+                        cond.notify_all()
+
+        results: list[Any] = []
+        # 同机但还没学到可用载荷时，第一张先单独探路：整批一起拿本地路径去撞 NapCat，
+        # 两边不同机就是每张一条 ENOENT，协议端控制台刷一屏，插件这边每张都白跑一趟
+        # 载荷降级。学到过（preferred 非空，或 modes[0] 已是 base64）就别再探了。
+        probe = (
+            bool(nc.same_host)
+            and nc.modes[0] == "path"
+            and not nc.preferred
+            and len(files) > 1
+        )
+        if probe:
+            try:
+                results.append(await push(*files[0]))
+            except Exception as e:  # 探路这张出意外也别拖垮整批
+                logger.warning(f"{PLUGIN_NAME} 相册上传探路异常: {e!r}")
+                results.append((None, f"{_mark(files[0][0])}：{e!r}"))
+        rest = files[1:] if probe else files
+        results += await asyncio.gather(
+            *(push(p, path) for p, path in rest), return_exceptions=True
+        )
+        ok, fails, marks = 0, [], []
+        for (pic, _), r in zip(files, results, strict=True):
+            if isinstance(r, BaseException):
+                fails.append(f"{_mark(pic)}：{r!r}")
+            elif r[0]:
+                ok += 1
+                modes[r[0]] = modes.get(r[0], 0) + 1
+                marks.append(_mark(pic))
+            else:
+                fails.append(r[1] or "未知错误")
+        if nc.same_host and modes:
+            # 同机探测学到的可用载荷方式记下来，下一批复用，别每批都撞一遍 ENOENT
+            learned = max(modes, key=lambda k: modes[k])
+            with contextlib.suppress(Exception):
+                await self.put_kv_data("payload:same_host", learned)
+        return ok, fails, marks
+
+    async def _album_upload_task(
+        self, session: str, platform: str, gid: str, item: dict[str, Any], want: str
+    ):
+        """单条微博 × 单个群的相册上传任务（转发成功后异步执行）。"""
+        post_id = str(item.get("post_id") or "")
+        pics = [p for p in (item.get("pics") or []) if isinstance(p, dict)]
+        try:
+            async with self._group_lock(gid):
+                await self._upload_batch(session, platform, gid, post_id, want, pics)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"{PLUGIN_NAME} 微博 {post_id} 图片上传群 {gid} 相册失败: {e!r}"
+            )
+
+    async def _upload_batch(
+        self,
+        session: str,
+        platform: str,
+        gid: str,
+        post_id: str,
+        want: str,
+        pics: list[dict[str, str]],
+    ):
+        """一批图片的完整上传流程：解析相册 -> 去重 -> 下载 -> 上传 -> 台账 -> 清理。"""
+        nc = await self._album_client(platform)
+        album_id, album_name = await self._resolve_album_cached(nc, gid, want)
+        sent = await self._sent_marks(gid, album_id)
+        # 相册文件名回读只在 same_host 下才做：base64 载荷会被 NapCat 改名成 randomUUID，
+        # 相册文件名里不含微博 pid，比对必然不命中，而它每次要翻最多 8 页媒体列表
+        # （一页一次协议端往返，串行）。自记台账才是这条链路可靠的去重依据。
+        existing = await self._existing_names(nc, gid, album_id) if nc.same_host else ""
+
+        def _dup(pic: dict[str, str]) -> bool:
+            mark = _mark(pic)
+            # 子串匹配是有意的：QQ 侧重名会把文件名改成 "<原名> (1)"，整词比对会漏
+            return bool(mark) and (mark in sent or mark in existing)
+
+        todo = [p for p in pics if not _dup(p)]
+        dup = len(pics) - len(todo)
+        if not todo:
+            logger.info(
+                f"微博 {post_id} 的 {len(pics)} 张图此前已传过相册「{album_name}」"
+                f"（群 {gid}），跳过"
+            )
+            return
+        folder = self._batch_dir(gid, post_id)
+        try:
+            dl_t0 = time.monotonic()
+            files = await self._download_pics(todo, folder)
+            dl_sec = time.monotonic() - dl_t0
+            if not files:
+                logger.warning(
+                    f"微博 {post_id} -> 群 {gid} 相册「{album_name}」："
+                    f"{len(todo)} 张图全部下载失败"
+                )
+                return
+            total_mb = sum(path.stat().st_size for _, path in files) / 1048576
+            # 记在重负载动作之前：整批卡住或进程崩了的时候，只有这行能说明当时在传多大一批
+            logger.info(
+                f"微博 {post_id} -> 群 {gid} 相册「{album_name}」：{len(files)} 张已下载"
+                f"（{total_mb:.1f}MB / {dl_sec:.1f}s），开始上传"
+            )
+            up_t0 = time.monotonic()
+            ok, fails, marks = await self._upload_files(
+                nc, gid, album_id, album_name, files
+            )
+            up_sec = time.monotonic() - up_t0
+            if marks:
+                await self._remember(gid, album_id, marks)
+            summary = (
+                f"微博 {post_id} -> 群 {gid} 相册「{album_name}」：成功 {ok}/{len(files)}"
+                f"，上传 {up_sec:.1f}s（{total_mb:.1f}MB，下载 {dl_sec:.1f}s）"
+            )
+            if dup:
+                summary += f"（另有 {dup} 张已传过跳过）"
+            if fails:
+                summary += f"，失败 {len(fails)} 张"
+            logger.info(summary)
+            if fails:
+                logger.warning(f"相册上传失败明细: {'; '.join(fails[:5])}")
+            if ok and bool(self.config.get("album_notify", False)):
+                text = f"📷 已将微博图片 {ok} 张上传到相册「{album_name}」"
+                if dup:
+                    text += f"（另有 {dup} 张此前已传过，跳过）"
+                if fails:
+                    text += f"，{len(fails)} 张失败"
+                await self._notify(session, text)
+        finally:
+            # 无论提前返回还是异常，批次目录（含 .part 残件）都不留到下一轮。
+            # 整批几十到几百 MB 的删除是阻塞调用，留在事件循环里能把整个 AstrBot
+            # 钉住数秒（同批其他群的推送与轮询跟着一起卡），丢线程池去删。
+            await asyncio.to_thread(shutil.rmtree, folder, True)
+
+    async def _notify(self, session: str, text: str):
+        try:
+            await self.context.send_message(session, MessageChain().message(text))
+        except Exception as e:
+            logger.info(f"{PLUGIN_NAME} 相册上传通知发送失败: {e!r}")
 
     # ---------------- 指令 ----------------
 
@@ -1099,7 +1950,7 @@ class WeiboMonitorPlugin(Star):
         if not uid:
             yield event.plain_result(
                 "用法：微博添加 <uid或主页链接>\n"
-                "例如：微博添加 1195230310 或 微博添加 https://weibo.com/u/1195230310"
+                "例如：微博添加 1234567890 或 微博添加 https://weibo.com/u/1234567890"
             )
             return
         self._sync_accounts_from_config()
@@ -1119,7 +1970,11 @@ class WeiboMonitorPlugin(Star):
         self.config.save_config()
         self._save_state()
         name = self.accounts[uid]["name"]
-        extra = "" if nickname else "（未能获取昵称，下轮检查会自动补齐，请留意确认 uid 正确）"
+        extra = (
+            ""
+            if nickname
+            else "（未能获取昵称，下轮检查会自动补齐，请留意确认 uid 正确）"
+        )
         yield event.plain_result(
             f"已添加监控：{name}（{uid}）{extra}\n"
             "下一轮检查将建立基线，历史微博不会推送，仅推送之后的新微博。"
@@ -1154,6 +2009,125 @@ class WeiboMonitorPlugin(Star):
             lines.append(f"{idx}. {info['name']}（{uid}）")
         sessions = self._sessions()
         lines.append(f"推送目标：{len(sessions)} 个（群内发送 微博绑定 添加）")
+        rules = self._album_rules()
+        lines.append(f"相册绑定：{len(rules)} 条（微博相册列表 查看）")
+        yield event.plain_result("\n".join(lines))
+
+    @weibo.command("相册绑定")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_album_bind(self, event: AstrMessageEvent, uid_text: str = ""):
+        """把某博主的微博图片自动上传到本群指定相册（管理员）：微博相册绑定 <uid或链接> <相册名或ID>"""
+        gid = event.get_group_id()
+        if not gid:
+            yield event.plain_result("请在目标群聊中使用该指令（图片将上传到本群相册）")
+            return
+        uid = _extract_uid(uid_text)
+        # 相册名可能含空格。GreedyStr 只存在于框架内部模块（astrbot.core）、未纳入
+        # astrbot.api 公开接口，这里按框架同一套分词规则（re.split(r"\s+")）手动取
+        # uid 之后的全部剩余参数，语义与 GreedyStr 的 " ".join(剩余参数) 一致
+        album_name = ""
+        if uid_text:
+            tokens = re.split(r"\s+", (event.message_str or "").strip())
+            with contextlib.suppress(ValueError):
+                album_name = " ".join(tokens[tokens.index(uid_text) + 1 :])
+        if not uid or not album_name:
+            yield event.plain_result(
+                "用法：微博相册绑定 <uid或主页链接> <相册名或ID>\n"
+                "例如：微博相册绑定 1234567890 美食图集\n"
+                "相册可用 微博列相册 查看名称与 ID"
+            )
+            return
+        self._sync_accounts_from_config()
+        if uid not in self.accounts:
+            yield event.plain_result(
+                f"账号 {uid} 不在监控列表中，请先用 微博添加 添加，或用 微博列表 查看"
+            )
+            return
+        rules = self._album_rules()
+        rules[(uid, str(gid))] = album_name
+        self.config["album_rules"] = [f"{u}:{g}:{a}" for (u, g), a in rules.items()]
+        self.config.save_config()
+        name = self.accounts[uid]["name"]
+        tip = (
+            ""
+            if event.unified_msg_origin in self._sessions()
+            else "\n注意：本群尚未 微博绑定，推送不成功不会触发图片上传"
+        )
+        logger.info(f"{PLUGIN_NAME} 相册绑定: {uid} -> 群 {gid} 相册「{album_name}」")
+        yield event.plain_result(
+            f"已绑定：{name}（{uid}）的微博图片将自动上传到本群相册「{album_name}」{tip}"
+        )
+
+    @weibo.command("相册移除")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_album_unbind(self, event: AstrMessageEvent, uid_text: str = ""):
+        """解除博主的相册绑定（管理员）：群内使用解除本群，私聊使用解除全部"""
+        uid = _extract_uid(uid_text)
+        if not uid:
+            yield event.plain_result("用法：微博相册移除 <uid>")
+            return
+        gid = event.get_group_id()
+        rules = self._album_rules()
+        targets = [
+            (u, g) for (u, g) in rules if u == uid and (not gid or g == str(gid))
+        ]
+        if not targets:
+            yield event.plain_result(
+                f"账号 {uid} 没有相册绑定记录（微博相册列表 查看）"
+            )
+            return
+        for key in targets:
+            rules.pop(key, None)
+        self.config["album_rules"] = [f"{u}:{g}:{a}" for (u, g), a in rules.items()]
+        self.config.save_config()
+        logger.info(f"{PLUGIN_NAME} 相册解绑: {uid} -> {targets}")
+        yield event.plain_result(
+            f"已解除 {len(targets)} 条绑定（群：{'、'.join(g for _, g in targets)}）"
+        )
+
+    @weibo.command("相册列表")
+    async def weibo_album_rules_cmd(self, event: AstrMessageEvent):
+        """查看所有博主的相册绑定规则"""
+        rules = self._album_rules()
+        if not rules:
+            yield event.plain_result(
+                "暂无绑定规则。在目标群内用 微博相册绑定 <uid> <相册名> 绑定"
+            )
+            return
+        bound_gids = {self._parse_umo(s)[2] for s in self._sessions()}
+        lines = ["博主相册绑定规则："]
+        for idx, ((uid, gid), album) in enumerate(rules.items(), 1):
+            name = self.accounts.get(uid, {}).get("name") or uid
+            tip = "" if gid in bound_gids else "（该群未绑定推送，不会触发上传）"
+            lines.append(f"{idx}. {name}（{uid}）→ 群 {gid} 相册「{album}」{tip}")
+        yield event.plain_result("\n".join(lines))
+
+    @weibo.command("列相册")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_album_list(self, event: AstrMessageEvent):
+        """查看本群的相册列表（名称与 ID，管理员）"""
+        gid = event.get_group_id()
+        if not gid:
+            yield event.plain_result("请在群聊中使用该指令")
+            return
+        platform, _, _ = self._parse_umo(event.unified_msg_origin)
+        yield event.plain_result("正在获取本群相册列表…")
+        try:
+            nc = await self._album_client(platform)
+            albums = await nc.list_albums(str(gid))
+        except NapCatError as e:
+            yield event.plain_result(f"获取相册列表失败：{e}")
+            return
+        if not albums:
+            yield event.plain_result(
+                "本群没有相册（或机器人没权限），请先在 QQ 里创建相册"
+            )
+            return
+        lines = ["本群相册："]
+        for idx, a in enumerate(albums, 1):
+            aid = pick(a, ALBUM_LIST_ITEM_ID_KEYS)
+            name = pick(a, ALBUM_LIST_ITEM_NAME_KEYS, "?")
+            lines.append(f"{idx}. {name}（ID: {aid}）")
         yield event.plain_result("\n".join(lines))
 
     @weibo.command("检测")
@@ -1184,7 +2158,9 @@ class WeiboMonitorPlugin(Star):
         """查看插件运行状态"""
         lines = ["微博监控运行状态："]
         last = (
-            datetime.fromtimestamp(self.last_check_ts).strftime("%Y-%m-%d %H:%M:%S")
+            datetime.fromtimestamp(self.last_check_ts, tz=_TZ_CN).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
             if self.last_check_ts
             else "尚未检查"
         )
@@ -1206,5 +2182,7 @@ class WeiboMonitorPlugin(Star):
             lines.append(f"身份模式：自定义 Cookie（{sorted(self._custom_cookies)}）")
         else:
             lines.append("身份模式：免 Cookie 游客身份")
-        lines.append(f"出网方式：{'代理 ' + self._proxy if self._proxy else '直连'}")
+        lines.append(
+            f"出网方式：{'代理 ' + _redact_proxy(self._proxy) if self._proxy else '直连'}"
+        )
         yield event.plain_result("\n".join(lines))

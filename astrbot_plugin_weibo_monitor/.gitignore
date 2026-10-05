@@ -1,4 +1,5 @@
 # 若本目录作为独立插件仓库发布，忽略以下内容
 __pycache__/
 *.py[cod]
+.ruff_cache/
 *.zip
