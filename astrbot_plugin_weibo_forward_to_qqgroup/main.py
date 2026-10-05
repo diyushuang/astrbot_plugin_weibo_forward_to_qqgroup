@@ -31,7 +31,7 @@ from .napcat_album import (
     pick,
 )
 
-PLUGIN_NAME = "astrbot_plugin_weibo_monitor"
+PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
 
 WEIBO_HOME_URL = "https://m.weibo.cn/"
 WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"

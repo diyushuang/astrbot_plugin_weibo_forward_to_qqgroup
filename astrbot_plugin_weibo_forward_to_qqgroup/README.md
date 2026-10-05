@@ -1,4 +1,4 @@
-# astrbot_plugin_weibo_monitor
+# astrbot_plugin_weibo_forward_to_qqgroup
 
 微博实时转发（AstrBot 插件）：**无需微博 Cookie**，实时轮询监控固定几个微博账号，有新微博自动把「昵称 + 摘要 + 链接」推送到绑定的 Q 群；并可将微博内的图片**自动上传到群相册**——不同博主可绑定不同相册，实况图自动转 GIF，推送消息可附带图片（`mw2000` 轻量档，原图进群相册）。
 
@@ -17,7 +17,7 @@
 
 ## 安装
 
-1. 将本目录（`astrbot_plugin_weibo_monitor/`）放入 AstrBot 的 `data/plugins/` 目录；
+1. 将本目录（`astrbot_plugin_weibo_forward_to_qqgroup/`）放入 AstrBot 的 `data/plugins/` 目录；
    或在 AstrBot WebUI「插件市场 → 从仓库安装」填入本插件仓库地址。
 2. 在 WebUI「插件」页面重载/启用插件。
 3. 安装依赖：AstrBot 会自动安装 `requirements.txt`（仅 `aiohttp`，AstrBot 本身已内置）。
@@ -26,16 +26,18 @@
 
 ## 升级
 
+> **v1.4.1 起插件改名**：标识由 `astrbot_plugin_weibo_monitor` 改为 `astrbot_plugin_weibo_forward_to_qqgroup`（避开与同类插件的目录重名，也顺带绕过 v4.28.0 上传同名包报「目录已存在」的限制）。配置与运行状态都按插件名存放，因此装上改名后的版本等于一次**全新安装**：绑定的群、监控账号、相册绑定规则需要在新的插件里重新添加，且请**先卸载旧插件**——两个插件同时开着会各轮询一遍同一批账号，微博请求量翻倍更容易触发风控，群里也会收到重复推送。首次运行只建立基线，不会倒灌历史微博。
+
 **方式一：AstrBot ≥ v4.28.2** —— 直接在 WebUI 上传新版本 zip 即可覆盖升级（自动备份旧目录，更新失败会自动恢复旧版本）。
 
-> 注意：v4.28.0 / v4.28.1 上传同名 zip 会报「安装失败：目录 astrbot_plugin_weibo_monitor 已存在」，这是 AstrBot 该版本的限制。请先升级 AstrBot，或用方式二。
+> 注意：v4.28.0 / v4.28.1 上传同名 zip 会报「安装失败：目录 astrbot_plugin_weibo_forward_to_qqgroup 已存在」，这是 AstrBot 该版本的限制。请先升级 AstrBot，或用方式二。
 
 **方式二：先卸载再上传（任何版本通用）**
 
 1. WebUI「插件」页卸载旧版本，**不要勾选「删除配置」**；
 2. 上传新版本 zip。
 
-**数据不会丢失**：插件配置存于 `data/config/astrbot_plugin_weibo_monitor_config.json`，运行状态（已见微博、游客身份、待推送队列）存于 `data/plugin_data/astrbot_plugin_weibo_monitor/state.json`，均不在插件目录内，上述操作不影响。
+**数据不会丢失**：插件配置存于 `data/config/astrbot_plugin_weibo_forward_to_qqgroup_config.json`，运行状态（已见微博、游客身份、待推送队列）存于 `data/plugin_data/astrbot_plugin_weibo_forward_to_qqgroup/state.json`，均不在插件目录内，上述操作不影响。
 
 **方式三（推荐长期使用）：仓库安装** —— 把插件推送到 GitHub 仓库后，用 WebUI「从仓库安装」安装，此后每次升级只需点击插件列表的「更新」按钮。
 
@@ -168,7 +170,7 @@ v1.4.0 起支持把微博图片自动上传到 QQ 群相册（能力来自同类
 
 1. 首次请求前自动预热 `m.weibo.cn` 并换取游客身份（本机实测可拿到 `ok=1` 的正常数据）；
 2. 每轮向 `https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}` 请求第一页微博；
-3. 与本地已见 ID（`data/plugin_data/astrbot_plugin_weibo_monitor/state.json`）比对去重，新微博按「旧→新」顺序推送到所有绑定会话；
+3. 与本地已见 ID（`data/plugin_data/astrbot_plugin_weibo_forward_to_qqgroup/state.json`）比对去重，新微博按「旧→新」顺序推送到所有绑定会话；
 4. 遇到 `ok=-100` / HTTP 418/432（游客身份过期或风控）时自动换新游客身份并重试一次；游客身份最长复用 3 天，到期主动更新并持久化到本地。
 
 ## 已知限制
@@ -184,7 +186,7 @@ v1.4.0 起支持把微博图片自动上传到 QQ 群相册（能力来自同类
 ## 目录结构
 
 ```
-astrbot_plugin_weibo_monitor/
+astrbot_plugin_weibo_forward_to_qqgroup/
 ├── main.py            # 插件主逻辑
 ├── napcat_album.py    # NapCat 群相册 OneBot 扩展客户端（上传/相册列表/去重）
 ├── metadata.yaml      # 插件元信息
