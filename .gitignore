@@ -3,14 +3,14 @@ __pycache__/
 *.py[cod]
 .ruff_cache/
 
-# 打包产物（发布时用 GitHub Release 或手动分发）
+# 打包产物（发布用 GitHub Release 或手动分发，zip 不进仓库）
 *.zip
+
+# 开发工具：A/B 实测脚本与其中间产物，不属于插件包
+bench/
 
 # 本地工具与临时数据
 .mimosa/
 .zcode/
 .playwright-mcp/
 _test_data/
-.playwright-mcp/
-# 本地开发用的 A/B bench 跑测脚本与产物，不随插件发布
-bench/

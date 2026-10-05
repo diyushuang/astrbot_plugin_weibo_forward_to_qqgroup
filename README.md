@@ -17,10 +17,13 @@
 
 ## 安装
 
-1. 将本目录（`astrbot_plugin_weibo_forward_to_qqgroup/`）放入 AstrBot 的 `data/plugins/` 目录；
-   或在 AstrBot WebUI「插件市场 → 从仓库安装」填入本插件仓库地址。
-2. 在 WebUI「插件」页面重载/启用插件。
-3. 安装依赖：AstrBot 会自动安装 `requirements.txt`（仅 `aiohttp`，AstrBot 本身已内置）。
+仓库**根目录就是插件本体**（`metadata.yaml`、`main.py`、`_conf_schema.json` 都在顶层），三种装法任选：
+
+1. **WebUI 从仓库安装**：填本插件仓库地址 `https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup`。
+2. **上传 zip**：在 WebUI「插件」页上传发布包 `astrbot_plugin_weibo_forward_to_qqgroup-vX.Y.Z.zip`。自己打包时沿用发布包的结构——zip 内放一层同名文件夹，把仓库根的文件装进 `astrbot_plugin_weibo_forward_to_qqgroup/` 里。
+3. **手动放置**：把仓库内容（不含 `.git`）复制到 `data/plugins/astrbot_plugin_weibo_forward_to_qqgroup/`。
+
+放好后在 WebUI「插件」页面重载/启用插件。依赖由 AstrBot 自动按 `requirements.txt` 安装（仅 `aiohttp`，AstrBot 本身已内置）。
 
 要求 AstrBot ≥ v4.9.2（上传台账使用 KV 存储，已通过 `metadata.yaml` 的 `astrbot_version` 声明，旧版本会明确提示不兼容），QQ 侧使用 aiocqhttp 适配器（NapCat、Lagrange 等）。
 
@@ -186,7 +189,7 @@ v1.4.0 起支持把微博图片自动上传到 QQ 群相册（能力来自同类
 ## 目录结构
 
 ```
-astrbot_plugin_weibo_forward_to_qqgroup/
+astrbot_plugin_weibo_forward_to_qqgroup/  ← 仓库根即插件目录
 ├── main.py            # 插件主逻辑
 ├── napcat_album.py    # NapCat 群相册 OneBot 扩展客户端（上传/相册列表/去重）
 ├── metadata.yaml      # 插件元信息
