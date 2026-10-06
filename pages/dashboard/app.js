@@ -83,6 +83,46 @@ function busy(btn, on) {
   btn.disabled = on;
 }
 
+/* ---------- 页内确认框 ----------
+ * AstrBot 插件页 iframe 的 sandbox 只有 allow-scripts/forms/downloads，没有
+ * allow-modals：window.confirm() 会被浏览器静默拦截并返回 false，导致「移除」
+ * 永远无法确认。所有原生弹窗都不能用，确认交互一律走本对话框。 */
+
+function confirmDialog(message) {
+  return new Promise((resolve) => {
+    const mask = el("div", "modal-mask");
+    const box = el("div", "modal");
+    box.append(el("div", "modal-title", "请确认操作"));
+    box.append(el("div", "modal-body", message));
+    const actions = el("div", "modal-actions");
+    const cancel = el("button", "btn", "取消");
+    const ok = el("button", "btn danger", "确认");
+    cancel.type = "button";
+    ok.type = "button";
+    actions.append(cancel, ok);
+    box.append(actions);
+    mask.append(box);
+    document.body.append(mask);
+
+    const close = (result) => {
+      document.removeEventListener("keydown", onKey);
+      mask.remove();
+      resolve(result);
+    };
+    const onKey = (ev) => {
+      if (ev.key === "Escape") close(false);
+    };
+    document.addEventListener("keydown", onKey);
+    // 点击遮罩视为取消；点在对话框内不关闭
+    mask.addEventListener("click", (ev) => {
+      if (ev.target === mask) close(false);
+    });
+    cancel.addEventListener("click", () => close(false));
+    ok.addEventListener("click", () => close(true));
+    ok.focus();
+  });
+}
+
 /* ---------- 渲染 ---------- */
 
 function tile(label, value, sub, tone) {
@@ -186,8 +226,11 @@ function renderAccounts(accounts) {
     if (acc.push_ok > 0) li.append(el("span", "badge", `已推 ${acc.push_ok}`));
     const rm = el("button", "btn-mini", "移除");
     rm.type = "button";
-    rm.addEventListener("click", () => {
-      if (!window.confirm(`确定取消监控「${acc.name}」（uid ${acc.uid}）吗？`)) return;
+    rm.addEventListener("click", async () => {
+      const confirmed = await confirmDialog(
+        `确定取消监控「${acc.name}」（uid ${acc.uid}）吗？`
+      );
+      if (!confirmed) return;
       act(rm, "accounts", { action: "remove", uid: acc.uid }, () =>
         setStatus(`已取消监控：${acc.name}`, "ok")
       );
@@ -215,8 +258,11 @@ function renderSessions(sessions) {
     li.append(main);
     const rm = el("button", "btn-mini", "移除");
     rm.type = "button";
-    rm.addEventListener("click", () => {
-      if (!window.confirm(`确定解除该推送目标吗？\n${umo}`)) return;
+    rm.addEventListener("click", async () => {
+      const confirmed = await confirmDialog(
+        `确定解除该推送目标吗？\n${umo}`
+      );
+      if (!confirmed) return;
       act(rm, "sessions", { action: "remove", umo }, () => setStatus("已移除推送目标", "ok"));
     });
     li.append(rm);
@@ -238,13 +284,11 @@ function renderRules(rules) {
     const op = el("td", "col-op");
     const rm = el("button", "btn-mini", "移除");
     rm.type = "button";
-    rm.addEventListener("click", () => {
-      if (
-        !window.confirm(
-          `确定移除该相册绑定吗？\n${rule.name || rule.uid} → 群 ${rule.gid} 相册「${rule.album}」`
-        )
-      )
-        return;
+    rm.addEventListener("click", async () => {
+      const confirmed = await confirmDialog(
+        `确定移除该相册绑定吗？\n${rule.name || rule.uid} → 群 ${rule.gid} 相册「${rule.album}」`
+      );
+      if (!confirmed) return;
       act(
         rm,
         "album-rules",

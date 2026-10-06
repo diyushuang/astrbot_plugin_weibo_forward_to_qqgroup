@@ -22,7 +22,7 @@ import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Video
 from astrbot.api.star import Context, Star, StarTools
 
 from .napcat_album import (
@@ -36,11 +36,12 @@ from .napcat_album import (
 from .dashboard import register_dashboard
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.5.2"
+PLUGIN_VERSION = "v1.6.0"
 
 WEIBO_HOME_URL = "https://m.weibo.cn/"
 WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_EXTEND_URL = "https://m.weibo.cn/statuses/extend"
+WEIBO_SHOW_URL = "https://m.weibo.cn/statuses/show"
 WEIBO_VISITOR_HOST = "https://visitor.passport.weibo.cn"
 WEIBO_GENVISITOR_URL = f"{WEIBO_VISITOR_HOST}/visitor/genvisitor"
 WEIBO_INCARNATE_URL = f"{WEIBO_VISITOR_HOST}/visitor/visitor"
@@ -54,13 +55,15 @@ WEIBO_VISITOR_REFERER = (
 # 出网白名单：微博时间线/全文接口 + 微博游客身份系统
 WEIBO_ALLOWED_HOSTS = {"m.weibo.cn", "visitor.passport.weibo.cn"}
 
-# 相册媒体下载白名单（与 API 白名单分离）：图片 CDN + 实况图视频段 CDN
+# 相册/视频媒体下载白名单（与 API 白名单分离）：图片 CDN + 视频段/视频 CDN。
+# .sina.com.cn 覆盖旧版视频 CDN（*.video.sina.com.cn）
 MEDIA_ALLOWED_SUFFIXES = (
     ".sinaimg.cn",
     ".weibocdn.com",
     ".weibocdn.me",
     ".weibo.com",
     ".weibo.cn",
+    ".sina.com.cn",
 )
 
 # UA 池：游客身份与 UA 绑定（一套身份一套指纹），全部为移动端 UA。
@@ -125,6 +128,16 @@ GIF_MAX_BYTES = 30 * 1024 * 1024  # 实况图 GIF 产物上限：超限回落封
 SINAIMG_RE = re.compile(
     r"(https?:)?//([a-z0-9]+)\.sinaimg\.cn/([a-z0-9]+)/([0-9a-zA-Z]+)\.(\w+)", re.I
 )
+
+# ---------------- 视频转发 ----------------
+VIDEO_TMP_DIR = "video_tmp"  # 视频推送的临时下载目录（插件数据目录下），发完即删
+VIDEO_MAX_MB_DEFAULT = 95  # 单视频下载/发送体积上限默认值：QQ 视频消息硬限 100MB，留出余量
+VIDEO_DL_TIMEOUT = 300.0  # 单个视频下载总超时（秒）：几十上百 MB 的文件比图片慢得多
+# 含视频消息的发送超时下限：视频上传 QQ 比九张图还慢，沿用图片的 60s 常常
+# "实际已发出但被判超时"，重试会让群里重复出现同一条视频
+VIDEO_SEND_TIMEOUT_FLOOR = 180
+VIDEO_FALLBACK_NOTE = "🎬 视频未能自动转发，请点原帖链接观看"
+VIDEO_PARTIAL_NOTE = "🎬 部分视频未能自动转发，请点原帖链接观看"
 
 # ---------------- WebUI 控制面板（dashboard.py 提供页面与 API） ----------------
 ACTIVITY_MAX = 200  # 最近动态最多保留条数（随 state.json 持久化）
@@ -322,6 +335,103 @@ def _pic_nodes(mb: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _abs_https(url: str) -> str:
+    """把接口里的协议相对地址（//host/...）与 http 地址统一成 https。"""
+    url = (url or "").strip()
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("http://"):
+        return "https://" + url[len("http://") :]
+    return url
+
+
+def _video_candidates(mi: dict[str, Any], prefer_hd: bool) -> list[str]:
+    """从 media_info 提取有序的 mp4 直链候选。
+
+    优先取新版多码率数组 playback_list 里的 mp4 档（m3u8 是 HLS 切片，
+    QQ 视频消息吃不了），hd 按清晰度降序、sd 升序；其后是旧版字段的
+    降级链。返回的每个 URL 都可直接下载，签名会过期，拿到就要马上用。
+    """
+    cands: list[str] = []
+    seen: set[str] = set()
+    playlist: list[tuple[int, int, str]] = []
+    pl = mi.get("playback_list")
+    if isinstance(pl, list):
+        for e in pl:
+            if not isinstance(e, dict):
+                continue
+            info = e.get("play_info") or {}
+            url = _abs_https(str(info.get("url") or ""))
+            if not url or url in seen:
+                continue
+            mime = str(info.get("mime") or "")
+            if url.lower().split("?")[0].endswith(".m3u8") or "mpegurl" in mime:
+                continue
+            try:
+                width = int(info.get("width") or 0)
+            except (TypeError, ValueError):
+                width = 0
+            try:
+                size = int(info.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            seen.add(url)
+            playlist.append((width, size, url))
+    playlist.sort(key=lambda t: (t[0], t[1]), reverse=prefer_hd)
+    cands.extend(u for _, _, u in playlist)
+    for key in (
+        "replay_hd",
+        "stream_url_hd",
+        "stream_url",
+        "mp4_hd_url",
+        "mp4_720p_mp4",
+        "mp4_sd_url",
+        "h5_url",
+        "video_clear",
+    ):
+        url = _abs_https(str(mi.get(key) or ""))
+        if url and url not in seen and not url.lower().split("?")[0].endswith(".m3u8"):
+            seen.add(url)
+            cands.append(url)
+    return cands
+
+
+def _mix_media_nodes(mb: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """解析图文视频混排结构 mix_media_info。
+
+    返回 (图片节点列表——与 _pic_nodes 的条目同构，可直接交给 _extract_pics 的
+    逐项转换逻辑, 视频的 media_info 列表)。各接口变体里媒体对象可能挂在
+    item.data / item.data.pic / item.page_info 下，逐层探测。
+    """
+    pic_nodes: list[dict[str, Any]] = []
+    medias: list[dict[str, Any]] = []
+    mix = mb.get("mix_media_info")
+    items = mix.get("items") if isinstance(mix, dict) else None
+    if not isinstance(items, list):
+        return pic_nodes, medias
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        data = it.get("data")
+        node = data if isinstance(data, dict) else it
+        mtype = str(it.get("type") or "")
+        if mtype == "video":
+            mi = node.get("media_info")
+            if not isinstance(mi, dict):
+                pi = node.get("page_info")
+                if isinstance(pi, dict):
+                    mi = pi.get("media_info")
+            if isinstance(mi, dict):
+                medias.append(mi)
+        elif mtype == "pic":
+            pic = node.get("pic")
+            if isinstance(pic, dict):
+                pic_nodes.append(pic)
+            elif node.get("url") or node.get("pid"):
+                pic_nodes.append(node)
+    return pic_nodes, medias
+
+
 def _extract_pics(
     mb: dict[str, Any], rt_mb: dict[str, Any] | None = None
 ) -> list[dict[str, str]]:
@@ -454,6 +564,9 @@ class WeiboMonitorPlugin(Star):
         self.last_check_ts = 0.0
         # ---- 群相册自动上传 ----
         self._album_tasks: set[asyncio.Task] = set()
+        # ---- 视频转发 ----
+        self._video_tasks: set[asyncio.Task] = set()
+        self._video_preparing: set[str] = set()  # 正在后台下载视频的 post_id
         # 上传并发闸 + 在途 base64 载荷字节预算（配置热改时重建）
         self._up_sem: asyncio.Semaphore | None = None
         self._up_conc = 0
@@ -500,10 +613,14 @@ class WeiboMonitorPlugin(Star):
             f"album_download_concurrency={self._int_cfg('album_download_concurrency', 5)} "
             f"album_upload_concurrency={self._int_cfg('album_upload_concurrency', 3)} "
             f"album_upload_payload_mb={self._float_cfg('album_upload_payload_mb', 32.0):g} "
-            f"album_live_gif={bool(self.config.get('album_live_gif', True))}"
+            f"album_live_gif={bool(self.config.get('album_live_gif', True))} "
+            f"message_with_videos={self._videos_enabled()} "
+            f"video_max_mb={self.config.get('video_max_mb')} "
+            f"video_quality={self.config.get('video_quality')}"
         )
         # 清掉上次运行残留的下载临时文件（正常流程传完即删，这里只兜底）
         await asyncio.to_thread(self._wipe_album_tmp)
+        await asyncio.to_thread(self._wipe_video_tmp)
         # DummyCookieJar：cookie 全部手工管理，避免与 jar 自动附带冲突。
         # 连接器 DNS 缓存放宽到 5 分钟（默认 10 秒）：微博系 host 极少变更，
         # 与校验侧的 _dns_cache 一起把每批图片几十次解析压到个位数
@@ -569,11 +686,18 @@ class WeiboMonitorPlugin(Star):
         if self._album_tasks:
             await asyncio.gather(*self._album_tasks, return_exceptions=True)
             self._album_tasks.clear()
+        # 视频下载任务同样在关 HTTP 会话之前撤掉
+        for task in list(self._video_tasks):
+            task.cancel()
+        if self._video_tasks:
+            await asyncio.gather(*self._video_tasks, return_exceptions=True)
+            self._video_tasks.clear()
         self._save_state()
         if self._http and not self._http.closed:
             await self._http.close()
         self._http = None
         await asyncio.to_thread(self._wipe_album_tmp)
+        await asyncio.to_thread(self._wipe_video_tmp)
         logger.info(f"{PLUGIN_NAME} 已停止")
 
     # ---------------- 配置与状态 ----------------
@@ -654,6 +778,13 @@ class WeiboMonitorPlugin(Star):
                 # v1.4.0 起待推送条目携带图片信息，旧状态文件没有该字段
                 if not isinstance(item.get("pics"), list):
                     item["pics"] = []
+                # v1.6.0 起携带视频信息；旧条目里的 video_file 路径若已随
+                # video_tmp 清空失效，_video_ready 会自动重置为待下载
+                if not isinstance(item.get("videos"), list):
+                    item["videos"] = []
+                if not isinstance(item.get("video_files"), list):
+                    item["video_files"] = []
+                item.setdefault("video_note", "")
                 pending.append(item)
         self.pending = pending[-PENDING_HARD_LIMIT:]
         self.last_check_ts = float(state.get("last_check_ts") or 0)
@@ -1212,6 +1343,86 @@ class WeiboMonitorPlugin(Star):
             logger.info(f"获取长微博 {status_id} 全文失败，使用摘要: {e}")
         return None
 
+    # ---------------- 视频提取（statuses/show 详情接口） ----------------
+
+    @staticmethod
+    def _video_nodes(
+        pi: Any, prefer_hd: bool, seen_urls: set[str]
+    ) -> list[dict[str, Any]]:
+        """从 page_info 提取一个视频的直链候选列表；直播中或无 media_info 时返回空。"""
+        out: list[dict[str, Any]] = []
+        if not isinstance(pi, dict) or str(pi.get("type") or "") != "video":
+            return out
+        if int(pi.get("live_status") or 0) == 1:
+            logger.info("检测到直播中的视频，暂不支持转发（可点原帖链接观看）")
+            return out
+        mi = pi.get("media_info")
+        if not isinstance(mi, dict):
+            return out
+        urls = [u for u in _video_candidates(mi, prefer_hd) if u not in seen_urls]
+        seen_urls.update(urls)
+        if urls:
+            out.append({"urls": urls})
+        return out
+
+    async def _apply_video(self, post: dict[str, Any]) -> None:
+        """视频帖拉取 statuses/show 详情，提取直链候选到 post["videos"]。
+
+        只对确定要推送的微博调用（时间线接口的 page_info 里常缺 media_info，
+        详情接口才有完整视频数据）。覆盖纯视频帖、图文混排（mix_media_info）
+        与转发原微博的视频；混排里的图片一并并入 post["pics"]。任何失败都
+        安全降级：videos 保持为空，推送时自动回落"请点原帖链接"提示。
+        """
+        if not post.get("is_video") or not self._videos_enabled():
+            return
+        pid = str(post["id"])
+        prefer_hd = str(self.config.get("video_quality") or "hd") != "sd"
+        try:
+            data = await self._api_get(
+                WEIBO_SHOW_URL,
+                {"id": pid},
+                referer=f"https://m.weibo.cn/detail/{pid}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except WeiboFetchError as e:
+            logger.info(f"获取微博 {pid} 视频详情失败，推送时将提示打开原帖: {e}")
+            return
+        detail = data.get("data")
+        if not isinstance(detail, dict):
+            return
+        videos: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        videos.extend(self._video_nodes(detail.get("page_info"), prefer_hd, seen_urls))
+        mix_pics, mix_medias = _mix_media_nodes(detail)
+        for mi in mix_medias:
+            urls = [u for u in _video_candidates(mi, prefer_hd) if u not in seen_urls]
+            seen_urls.update(urls)
+            if urls:
+                videos.append({"urls": urls})
+        rt = detail.get("retweeted_status")
+        if isinstance(rt, dict) and not videos:
+            # 外层没有视频才看转发原微博（转发时原视频挂在 rt 的结构里）
+            videos.extend(self._video_nodes(rt.get("page_info"), prefer_hd, seen_urls))
+            _, rt_medias = _mix_media_nodes(rt)
+            for mi in rt_medias:
+                urls = [
+                    u for u in _video_candidates(mi, prefer_hd) if u not in seen_urls
+                ]
+                seen_urls.update(urls)
+                if urls:
+                    videos.append({"urls": urls})
+        cap = max(1, self._int_cfg("max_videos_per_post", 2))
+        post["videos"] = videos[:cap]
+        if mix_pics:
+            # 混排帖的图可能不在 mblog.pics 里（只出现在 mix_media_info），并入图片列表
+            merged = list(post.get("pics") or [])
+            have = {str(p.get("pid") or "") for p in merged}
+            for p in _extract_pics({"pics": mix_pics}):
+                if str(p.get("pid") or "") not in have:
+                    merged.append(p)
+            post["pics"] = merged
+
     async def _fetch_timeline_page(self, uid: str, page: int) -> list[dict[str, Any]]:
         """拉取用户时间线的指定页，返回解析后的帖子列表（新→旧）。"""
         data = await self._api_get(
@@ -1225,12 +1436,20 @@ class WeiboMonitorPlugin(Star):
             },
             referer=f"https://m.weibo.cn/u/{uid}",
         )
-        cards = (data.get("data") or {}).get("cards") or []
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            return []
+        cards = payload.get("cards") or []
         posts: list[dict[str, Any]] = []
         for card in cards:
+            # 接口对已删除/隐藏的微博会在 cards 里留 null 槽位，条目不保证是对象
+            if not isinstance(card, dict):
+                continue
             if card.get("card_type") != 9:
                 continue
-            mb = card.get("mblog") or {}
+            mb = card.get("mblog")
+            if not isinstance(mb, dict):
+                continue
             if self._is_pinned(card, mb):
                 continue
             post = self._parse_post(mb, uid)
@@ -1531,6 +1750,11 @@ class WeiboMonitorPlugin(Star):
             if len(self.pending) >= PENDING_HARD_LIMIT:
                 logger.warning("待推送队列已满，丢弃更早的新微博")
                 continue
+            # 视频详情按需拉取（每帖最多 1 次额外请求）：放在过滤之后，
+            # 被过滤掉的帖子不花这个请求
+            await self._apply_video(post)
+            videos_enabled = self._videos_enabled()
+            extracted = post.get("videos") or []
             self.pending.append(
                 {
                     "post_id": post["id"],
@@ -1540,13 +1764,22 @@ class WeiboMonitorPlugin(Star):
                     "retries": 0,
                     "pics": (post.get("pics") or [])[:max_imgs],
                     "is_video": bool(post.get("is_video")),
+                    "videos": extracted,
+                    "video_files": [],
+                    # 检测到视频但没提取到直链（直播/详情缺失）：直接降级提示，
+                    # 否则 _video_ready 会一直等一个永远不会完成的下载
+                    "video_note": (
+                        VIDEO_FALLBACK_NOTE
+                        if videos_enabled and post.get("is_video") and not extracted
+                        else ""
+                    ),
                 }
             )
         info["seen_ids"] = seen_list[-SEEN_IDS_LIMIT:]
         return len(new_posts), True
 
     def _build_chain(self, item: dict[str, Any]) -> MessageChain:
-        """构建推送消息链：文本 + 可选图片段（message_with_images 开启时）。"""
+        """构建推送消息链：文本 + 可选图片段 + 可选视频段（message_with_* 开启时）。"""
         chain = MessageChain().message(item["text"])
         if bool(self.config.get("message_with_images", True)):
             for pic in item.get("pics") or []:
@@ -1554,11 +1787,25 @@ class WeiboMonitorPlugin(Star):
                 if url:
                     # 轻量档：群里看够了，原图交给相册那条路
                     chain.chain.append(Image.fromURL(to_light(url)))
+        if self._videos_enabled():
+            for path in item.get("video_files") or []:
+                p = Path(str(path))
+                if p.is_file():
+                    chain.chain.append(Video.fromFileSystem(path=str(p)))
+            note = str(item.get("video_note") or "")
+            if note:
+                chain.message("\n" + note)
         return chain
 
-    async def _send_with_timeout(self, session: str, chain: MessageChain) -> bool:
+    async def _send_with_timeout(
+        self, session: str, chain: MessageChain, *, timeout_seconds: int | None = None
+    ) -> bool:
         """带超时的主动消息发送，防止单个适配器卡死拖住整个轮询任务。"""
-        send_timeout = self._int_cfg("message_send_timeout", 60)
+        send_timeout = (
+            self._int_cfg("message_send_timeout", 60)
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         try:
             if send_timeout > 0:
                 ok = await asyncio.wait_for(
@@ -1576,10 +1823,16 @@ class WeiboMonitorPlugin(Star):
             raise TimeoutError(f"发送超过 {send_timeout} 秒，平台是否已接收未知") from e
 
     def _pending_discard(self, item: dict[str, Any]):
-        """按对象身份从待推送队列移除一条（内容相同的两条互不误伤）。"""
+        """按对象身份从待推送队列移除一条（内容相同的两条互不误伤）。
+
+        已下载的视频临时文件一并删除：条目离队的三种出口（已推送/放弃/过期）
+        都不再需要它。
+        """
         for i, it in enumerate(self.pending):
             if it is item:
                 del self.pending[i]
+                for f in item.get("video_files") or []:
+                    Path(str(f)).unlink(missing_ok=True)
                 return
 
     async def _flush_pending(self) -> bool:
@@ -1619,11 +1872,21 @@ class WeiboMonitorPlugin(Star):
                 self._pending_discard(item)
                 changed = True
                 continue
+            if not self._video_ready(item):
+                # 视频还在后台下载：本轮跳过，下轮再发。不消耗重试次数——
+                # 下载不是失败，烧完重试配额会把已经下好的视频一起弄丢
+                self._ensure_video_prepare(item)
+                continue
             sent_sessions: list[str] = []
             chain = self._build_chain(item)
+            send_timeout = self._int_cfg("message_send_timeout", 60)
+            if send_timeout and item.get("video_files"):
+                send_timeout = max(send_timeout, VIDEO_SEND_TIMEOUT_FLOOR)
             for session in sessions:
                 try:
-                    if await self._send_with_timeout(session, chain):
+                    if await self._send_with_timeout(
+                        session, chain, timeout_seconds=send_timeout
+                    ):
                         sent_sessions.append(session)
                 except asyncio.CancelledError:
                     raise
@@ -1654,6 +1917,130 @@ class WeiboMonitorPlugin(Star):
             self.pending = self.pending[-PENDING_HARD_LIMIT:]
             changed = True
         return changed
+
+    # ---------------- 视频转发 ----------------
+
+    def _videos_enabled(self) -> bool:
+        return bool(self.config.get("message_with_videos", True))
+
+    def _video_tmp_root(self) -> Path:
+        assert self._data_dir is not None
+        return self._data_dir / VIDEO_TMP_DIR
+
+    def _wipe_video_tmp(self):
+        """清掉上次运行残留的视频临时文件（正常流程发完即删，这里只兜底）。"""
+        shutil.rmtree(self._video_tmp_root(), ignore_errors=True)
+
+    def _video_ready(self, item: dict[str, Any]) -> bool:
+        """条目的视频是否已就绪可发送：未开启 / 无视频 / 已下载 / 已降级 都算就绪。
+
+        已下载的文件在磁盘上消失（重启清空 video_tmp）时清掉旧结论回到待下载，
+        由后台任务重新下载——直链可能已过期，再失败就重新降级提示链接。
+        """
+        if not self._videos_enabled():
+            return True
+        files = [str(f) for f in item.get("video_files") or [] if f]
+        if files:
+            alive = [f for f in files if Path(f).is_file()]
+            if len(alive) != len(files):
+                item["video_files"] = alive
+                files = alive
+            if files:
+                return True
+            # 文件全部失效：清掉上一次的降级结论，按候选直链重新下载
+            item["video_note"] = ""
+        # 下载已有定论（全失败/部分失败都记了提示）就不再等后台任务
+        if item.get("video_note"):
+            return True
+        # 没有本地文件也没有定论：还有候选直链就等下载，否则按无视频处理
+        return not (item.get("videos") or [])
+
+    def _ensure_video_prepare(self, item: dict[str, Any]):
+        """为条目派发视频下载任务（同一微博同时只有一个，任务不阻塞轮询循环）。"""
+        post_id = str(item.get("post_id") or "")
+        if post_id in self._video_preparing:
+            return
+        self._video_preparing.add(post_id)
+        task = asyncio.create_task(self._video_prepare(item))
+        self._video_tasks.add(task)
+        task.add_done_callback(self._video_tasks.discard)
+
+    async def _video_prepare(self, item: dict[str, Any]) -> None:
+        """后台下载条目视频到 video_tmp：成功填 video_files，失败填降级提示。
+
+        与相册下载共用 _dl_gate 并发闸（微博媒体下载总并发不因视频新增一路）；
+        下载前过磁盘保护线。下载结束回写 state.json，重启后不必重下；若条目
+        已被丢弃（过期/放弃/重发），产物不留死角。
+        """
+        post_id = str(item.get("post_id") or "")
+        entries = [v for v in (item.get("videos") or []) if isinstance(v, dict)]
+        files: list[str] = []
+        try:
+            try:
+                cap_mb = int(self.config.get("video_max_mb"))
+            except (TypeError, ValueError):
+                cap_mb = VIDEO_MAX_MB_DEFAULT
+            max_bytes: int | float = (
+                cap_mb * 1048576 if cap_mb > 0 else float("inf")
+            )
+            root = self._video_tmp_root()
+            root.mkdir(parents=True, exist_ok=True)
+            free_mb = (
+                await asyncio.to_thread(lambda: shutil.disk_usage(root).free)
+            ) // 1048576
+            if free_mb < DISK_FLOOR_MB:
+                raise WeiboFetchError(
+                    f"临时目录所在磁盘仅剩 {free_mb}MB"
+                    f"（低于 {DISK_FLOOR_MB}MB 保护线），已取消视频下载"
+                )
+            stem_base = BAD_NAME_RE.sub("", post_id)[:48] or "video"
+            for idx, v in enumerate(entries):
+                dest = root / f"{stem_base}_{idx}.mp4"
+                got = False
+                for url in [str(u) for u in (v.get("urls") or []) if u]:
+                    try:
+                        await self._validate_media_url(url)
+                        await self._stream_to_file(
+                            url,
+                            dest,
+                            max_bytes=max_bytes,
+                            timeout_total=VIDEO_DL_TIMEOUT,
+                        )
+                        files.append(str(dest))
+                        got = True
+                        break
+                    except (
+                        WeiboFetchError,
+                        aiohttp.ClientError,
+                        asyncio.TimeoutError,
+                        OSError,
+                    ) as e:
+                        # 中断的下载会留下半截残件：删掉再试下一候选
+                        dest.unlink(missing_ok=True)
+                        logger.info(
+                            f"微博 {post_id} 视频 {idx} 直链下载失败，尝试下一候选: {e!r}"
+                        )
+                if not got:
+                    dest.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            for f in files:
+                Path(f).unlink(missing_ok=True)
+            raise
+        except Exception as e:
+            logger.warning(f"微博 {post_id} 视频下载异常: {e!r}")
+        finally:
+            self._video_preparing.discard(post_id)
+            if all(queued is not item for queued in self.pending):
+                # 条目已从队列消失（过期/放弃）：刚下载的文件一并清掉
+                for f in files:
+                    Path(f).unlink(missing_ok=True)
+            else:
+                item["video_files"] = files
+                if entries and len(files) < len(entries):
+                    item["video_note"] = (
+                        VIDEO_FALLBACK_NOTE if not files else VIDEO_PARTIAL_NOTE
+                    )
+                self._save_state()
 
     # ---------------- 群相册自动上传 ----------------
 
@@ -1923,14 +2310,25 @@ class WeiboMonitorPlugin(Star):
             raise WeiboFetchError(f"媒体域名解析失败: {host} ({e})") from e
         self._ensure_public_addrs(infos, f"媒体域名 {host} ")
 
-    async def _stream_to_file(self, url: str, dest: Path):
-        """流式下载到 dest（64KB 分块边下边写），超限中途抛错由调用方清理残件。"""
+    async def _stream_to_file(
+        self,
+        url: str,
+        dest: Path,
+        *,
+        max_bytes: int | float = IMG_MAX_BYTES,
+        timeout_total: float = 60.0,
+    ):
+        """流式下载到 dest（64KB 分块边下边写），超限中途抛错由调用方清理残件。
+
+        图片与视频共用：视频体积大、下载慢，上限与总超时由调用方给。
+        """
         assert self._http is not None
         headers = {
             "User-Agent": self._ua or UA_POOL[0],
+            # 微博媒体 CDN 校验 Referer（视频 CDN 无此头直接 403）
             "Referer": "https://weibo.com/",
         }
-        timeout = aiohttp.ClientTimeout(total=60)
+        timeout = aiohttp.ClientTimeout(total=timeout_total)
         got = 0
         async with self._http.get(
             url, headers=headers, timeout=timeout, proxy=self._proxy
@@ -1944,10 +2342,13 @@ class WeiboMonitorPlugin(Star):
             with dest.open("wb") as fh:
                 async for chunk in resp.content.iter_chunked(65536):
                     got += len(chunk)
-                    if got > IMG_MAX_BYTES:
-                        raise WeiboFetchError(
-                            f"单张媒体超过 {IMG_MAX_BYTES // 1048576}MB 上限"
+                    if got > max_bytes:
+                        limit_mb = (
+                            int(max_bytes // 1048576)
+                            if isinstance(max_bytes, int)
+                            else max_bytes / 1048576
                         )
+                        raise WeiboFetchError(f"单个媒体超过 {limit_mb:g}MB 上限")
                     fh.write(chunk)
 
     async def _download_pic(self, pic: dict[str, str], dest: Path) -> Path:
