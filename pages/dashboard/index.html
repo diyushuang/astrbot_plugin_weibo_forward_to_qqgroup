@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微博实时转发 · 控制面板</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main class="page-shell">
+
+  <header class="page-header">
+    <div class="page-title">
+      <div class="eyebrow">微博实时转发</div>
+      <h1>控制面板 <span id="version-chip" class="chip" hidden></span></h1>
+      <p class="subtitle">免 Cookie 监控微博更新并实时转发到Q群，图片自动进群相册</p>
+    </div>
+    <div class="header-actions">
+      <button id="btn-check" class="btn primary" type="button">立即检查</button>
+      <button id="btn-refresh" class="btn" type="button">刷新</button>
+    </div>
+  </header>
+
+  <div id="status" class="status-line" hidden></div>
+
+  <section class="card">
+    <h2>运行状态</h2>
+    <div class="status-grid" id="status-grid"></div>
+  </section>
+
+  <div class="grid-2">
+    <section class="card">
+      <h2>监控博主 <span class="count" id="accounts-count">0</span></h2>
+      <form id="account-form" class="row-form">
+        <input id="account-input" type="text" placeholder="uid 或主页链接" autocomplete="off">
+        <button class="btn primary" type="submit">添加</button>
+      </form>
+      <ul class="list" id="account-list"></ul>
+      <p class="empty" id="accounts-empty">尚未监控任何账号。添加后下一轮检查会先建立基线，历史微博不会推送。</p>
+    </section>
+
+    <section class="card">
+      <h2>推送目标 <span class="count" id="sessions-count">0</span></h2>
+      <form id="session-form" class="row-form">
+        <input id="session-input" type="text" placeholder="平台:消息类型:会话号" autocomplete="off">
+        <button class="btn primary" type="submit">添加</button>
+      </form>
+      <ul class="list" id="session-list"></ul>
+      <p class="empty" id="sessions-empty">尚未绑定推送目标。推荐在目标群里发「微博绑定」自动带出会话 ID。</p>
+      <p class="hint">会话 ID 格式：平台:消息类型:会话号，群聊的消息类型为 GroupMessage。</p>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>相册绑定规则 <span class="count" id="rules-count">0</span></h2>
+    <form id="rule-form" class="rule-form">
+      <input id="rule-uid" type="text" placeholder="uid 或主页链接" autocomplete="off">
+      <input id="rule-gid" type="text" placeholder="群号" autocomplete="off">
+      <input id="rule-album" type="text" placeholder="相册名或 ID" autocomplete="off">
+      <button class="btn primary" type="submit">添加</button>
+    </form>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>博主</th><th>群号</th><th>相册</th><th class="col-op"></th></tr></thead>
+        <tbody id="rule-rows"></tbody>
+      </table>
+      <p class="empty" id="rules-empty">暂无规则。绑定后，对应博主的微博图片会在推送成功后自动上传到该群相册（可用「微博列相册」查看群内相册）。</p>
+    </div>
+    <p class="hint" id="album-disabled-tip" hidden>相册上传总开关当前为关闭状态，可在插件配置面板开启。</p>
+  </section>
+
+  <section class="card">
+    <h2>待推送队列 <span class="count" id="pending-count">0</span></h2>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>博主</th><th>内容摘要</th><th>入队时间</th><th>重试</th></tr></thead>
+        <tbody id="pending-rows"></tbody>
+      </table>
+      <p class="empty" id="pending-empty">队列为空，没有待推送的微博。</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>运行统计</h2>
+    <div class="stat-tiles" id="stat-tiles"></div>
+    <div class="stats-flex">
+      <div class="chart-block">
+        <h3>近 7 天推送</h3>
+        <div class="bars" id="daily-bars"></div>
+      </div>
+      <div class="rank-block">
+        <h3>博主推送排行</h3>
+        <ol class="ranking" id="ranking"></ol>
+        <p class="empty" id="ranking-empty">暂无推送记录。</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>最近动态</h2>
+    <ul class="activity" id="activity-list"></ul>
+    <p class="empty" id="activity-empty">暂无动态。插件产生推送、相册上传、风控或异常事件后会显示在这里。</p>
+  </section>
+
+  <section class="card">
+    <details class="about">
+      <summary>功能与指令说明</summary>
+      <div class="about-body">
+        <h3>功能特性</h3>
+        <ul>
+          <li>免 Cookie：自动向微博游客系统换取匿名身份并维护续期，无需提供账号 Cookie（也支持自定义 Cookie 模式）</li>
+          <li>准实时轮询：默认 120 秒一轮（最小 30 秒），逐账号检查新微博并推送到绑定的群</li>
+          <li>推送带图：消息附带轻量图（mw2000），转发微博也会推送，支持屏蔽词/白名单/时效过滤</li>
+          <li>群相册：按博主绑定相册，原图自动上传（实况图转 GIF 需 ffmpeg），台账去重防重复</li>
+          <li>可靠性：失败重试补推、风控自愈（418/432 全局冷却梯度）、基线防历史刷屏、状态持久化</li>
+        </ul>
+        <h3>聊天指令</h3>
+        <table class="table cmd-table">
+          <tbody>
+            <tr><td>微博绑定 / 微博解绑</td><td>把当前群绑定为推送目标 / 解除（管理员）</td></tr>
+            <tr><td>微博添加 &lt;uid或链接&gt; / 微博删除 &lt;uid&gt;</td><td>添加监控账号 / 取消监控（管理员）</td></tr>
+            <tr><td>微博列表</td><td>查看监控账号与推送目标</td></tr>
+            <tr><td>微博相册绑定 &lt;uid&gt; &lt;相册名或ID&gt; / 微博相册移除 &lt;uid&gt;</td><td>绑定/解除博主图片上传到本群相册（管理员）</td></tr>
+            <tr><td>微博相册列表 / 微博列相册</td><td>查看相册绑定规则 / 查看本群相册（管理员）</td></tr>
+            <tr><td>微博检测 / 微博状态</td><td>立即检查一轮（管理员）/ 查看运行状态</td></tr>
+          </tbody>
+        </table>
+        <h3>说明</h3>
+        <ul>
+          <li>本页面的增删操作与聊天指令写入同一份插件配置，立即生效</li>
+          <li>更细的参数（消息模板、过滤词、并发等）在插件配置面板调整</li>
+          <li>面板数据每 20 秒自动刷新，也可点右上角「刷新」</li>
+        </ul>
+      </div>
+    </details>
+  </section>
+
+  <footer class="page-footer">数据每 20 秒自动刷新 · 由插件 WebUI 面板提供</footer>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
