@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import Any, Callable
+
+from astrbot.api import logger
 
 try:  # 新版 AstrBot：astrbot.api.web 提供请求代理与响应助手
     from astrbot.api.web import error_response, json_response
@@ -71,11 +72,6 @@ ACTIVITY_PAGE_LIMIT = 50
 ERRLOG_PAGE_LIMIT = 50
 
 
-def _plog(plugin_name: str) -> logging.Logger:
-    """与 main.py 同名的插件子日志器：面板侧的告警同样进错误留存。"""
-    return logging.getLogger(f"astrbot.plugins.{plugin_name}")
-
-
 def register_dashboard(
     plugin,
     plugin_name: str,
@@ -104,7 +100,7 @@ def register_dashboard(
             register(route, handler, methods, desc)
             ok = True
         except Exception as e:
-            _plog(plugin_name).warning(f"注册面板接口 {route} 失败: {e!r}")
+            logger.warning(f"{plugin_name} 注册面板接口 {route} 失败: {e!r}")
     return ok
 
 
@@ -124,7 +120,7 @@ class DashboardAPI:
         self.version = version
         self._extract_uid = extract_uid
         self._redact_proxy = redact_proxy
-        self._log = _plog(plugin_name)
+        self._log = logger
 
     # ---------------- 工具 ----------------
 

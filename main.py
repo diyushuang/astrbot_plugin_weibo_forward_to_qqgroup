@@ -23,10 +23,17 @@ from urllib.parse import quote, urlparse, urlunparse
 
 import aiohttp
 
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Video
 from astrbot.api.star import Context, Star, StarTools
+
+try:
+    # v4.28+ 的官方按插件隔离日志器工厂（enricher filter 注入 plugin_tag 等
+    # 字段、面板可按插件调日志级别）；旧版没有它，错误留存回退挂共享日志器
+    from astrbot.core.log import LogManager
+except ImportError:  # 独立脚本 / 旧版 AstrBot / 基准测试环境
+    LogManager = None
 
 try:
     # 与 Video.to_dict() 读的是同一个全局配置对象，用它探测 callback_api_base
@@ -46,12 +53,26 @@ from .napcat_album import (
 from .dashboard import register_dashboard
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.6.3"
+PLUGIN_VERSION = "v1.6.4"
 
-# 插件专属子日志器：挂在 astrbot 命名空间下，继承 AstrBot 的处理器与有效级别
-# （主日志照常输出），同时让"错误留存 Handler"只挂在本插件名下——不会把其它
-# 插件的告警也收进留存，重载时也能精确摘除
-logger = logging.getLogger(f"astrbot.plugins.{PLUGIN_NAME}")
+
+def _plugin_log_target() -> "logging.Logger":
+    """错误留存 Handler 应挂载的日志器。
+
+    v4.28+ 的 astrbot.api.logger 是按调用方路由的代理：本插件的记录实际走
+    LogManager.get_plugin_logger(<插件名>) 的专属日志器（astrbot.plugin.*，
+    enricher filter 注入 plugin_tag 等字段、propagate=False）。绝不能用自建
+    的子日志器绕过它——记录缺 plugin_tag 会撞上 AstrBot LogQueueHandler 的
+    无保护格式化，ValueError 一路炸回插件加载（v1.6.3 安装失败的根因）。
+    旧版没有按插件日志器时回退共享的 "astrbot"，由留存的 src_root 过滤兜住。
+    """
+    try:
+        if LogManager is not None and hasattr(LogManager, "get_plugin_logger"):
+            return LogManager.get_plugin_logger(PLUGIN_NAME)
+    except Exception:
+        pass
+    return logging.getLogger("astrbot")
+
 
 WEIBO_HOME_URL = "https://m.weibo.cn/"
 WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"
@@ -571,18 +592,32 @@ class _ErrorLogStore(logging.Handler):
     的瞬间落盘，重启后面板仍能还原"死机前最后在报什么"。写入在日志调用的
     线程里同步完成——告警是低频事件，几毫秒的 fsync 换确定性留存值得。
     JSONL 一行一条（msg 里的换行会被转义），重启后按行回读进缓冲。
-    挂在插件专属子日志器上，只收本插件的告警；异常绝不外抛（留存本身不能
-    变成新的故障点），磁盘满/读不动时静默放弃。
+    挂在 AstrBot 官方的插件日志器（v4.28+）或共享日志器（旧版）上，配合
+    src_root 目录过滤只收本插件的告警；异常绝不外抛（留存本身不能变成新的
+    故障点），磁盘满/读不动时静默放弃。
     """
 
-    def __init__(self, path: Path, buffer_size: int = ERRLOG_BUFFER):
+    def __init__(
+        self,
+        path: Path,
+        src_root: str = "",
+        buffer_size: int = ERRLOG_BUFFER,
+    ):
         super().__init__(level=logging.WARNING)
         self._path = path
+        # 只收本插件目录下代码发出的记录：旧版 AstrBot 的共享日志器上还会
+        # 流过核心与其它插件的日志，按源码目录区分（v4.28+ 的专属插件日志器
+        # 天然只有本插件记录，此过滤是双保险）
+        self._src_root = os.path.normcase(src_root) if src_root else ""
         self._buf: deque[dict[str, Any]] = deque(maxlen=buffer_size)
         self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if self._src_root:
+                pn = os.path.normcase(getattr(record, "pathname", "") or "")
+                if not pn.startswith(self._src_root):
+                    return
             entry = {
                 "ts": record.created,
                 "level": record.levelname,
@@ -710,6 +745,7 @@ class WeiboMonitorPlugin(Star):
         self._ffmpeg = ""  # ffmpeg 可执行文件路径，initialize 时探测
         self._diag_path: Path | None = None  # 相册上传诊断文件（initialize 时解析）
         self._errlog: _ErrorLogStore | None = None  # 错误留存（initialize 时挂载）
+        self._errlog_target: "logging.Logger | None" = None  # 留存挂在哪个日志器
         # ---- WebUI 控制面板（dashboard.py 注册路由，旧版 AstrBot 自动降级）----
         self._web_ready = False
         self._manual_check_task: asyncio.Task | None = None
@@ -740,12 +776,16 @@ class WeiboMonitorPlugin(Star):
         # 错误留存：挂上后本插件所有 warning/error 立即落盘，面板可查；
         # 启动时回读上次运行残留的文件尾部（死机前的告警不丢）。
         # 先摘掉可能残留的旧实例（异常退出没走 terminate 时防重复挂载）
-        for h in list(logger.handlers):
+        self._errlog = _ErrorLogStore(
+            self._data_dir / ERRLOG_FILE,
+            src_root=str(Path(__file__).resolve().parent),
+        )
+        self._errlog_target = _plugin_log_target()
+        for h in list(self._errlog_target.handlers):
             if isinstance(h, _ErrorLogStore):
-                logger.removeHandler(h)
-        self._errlog = _ErrorLogStore(self._data_dir / ERRLOG_FILE)
+                self._errlog_target.removeHandler(h)
         try:
-            logger.addHandler(self._errlog)
+            self._errlog_target.addHandler(self._errlog)
         except Exception:
             self._errlog = None
         else:
@@ -818,9 +858,11 @@ class WeiboMonitorPlugin(Star):
     async def terminate(self):
         # 留存 Handler 先摘掉：重载时重复挂载会把每条告警收两遍
         if self._errlog is not None:
+            target = self._errlog_target or _plugin_log_target()
             with contextlib.suppress(Exception):
-                logger.removeHandler(self._errlog)
+                target.removeHandler(self._errlog)
             self._errlog = None
+            self._errlog_target = None
         if self._poll_task:
             self._poll_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [1.6.4] - 2026-10-07
+
+### 修复
+
+- **v1.6.3 在 AstrBot v4.28+ 上安装即失败（`Formatting field not found in record: 'plugin_tag'`）**：v1.6.3 为做错误留存把插件日志改挂到自建的子日志器上，而 v4.28 起 `astrbot.api.logger` 是按调用方路由到 `LogManager.get_plugin_logger(<插件名>)` 专属日志器的代理——`plugin_tag` 等字段由直接挂在该日志器上的 enricher filter 注入，自建子日志器的记录绕过了它，撞上 `LogQueueHandler` 无保护的格式化，ValueError 一路炸回插件加载。现回归官方 `astrbot.api.logger`，错误留存改挂到官方插件日志器（旧版 AstrBot 自动回退共享日志器 + 按插件源码目录过滤），顺带获得面板逐插件日志级别调节能力。
+
 ## [1.6.3] - 2026-10-07
 
 ### 新增
