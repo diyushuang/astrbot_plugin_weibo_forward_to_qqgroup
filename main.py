@@ -230,6 +230,11 @@ USAGE = (
     "微博相册移除 <uid> - 解除博主的相册绑定（管理员）\n"
     "微博相册列表 - 查看所有相册绑定规则\n"
     "微博列相册 - 查看本群的相册列表（管理员）\n"
+    "微博关键词相册 <关键词> <群号> <相册名或ID> - 命中关键词的微博图片只传固定群相册（管理员，全局规则；群内可省群号）\n"
+    "微博关键词相册移除 <关键词> - 删除同名全局关键词规则（管理员）\n"
+    "微博博主关键词相册 <uid> <关键词> <群号> <相册名或ID> - 关键词规则只对该博主生效，优先于全局（管理员；群内可省群号）\n"
+    "微博博主关键词相册移除 <uid> <关键词> - 删除该博主的关键词规则（管理员）\n"
+    "微博关键词相册列表 - 查看关键词路由规则\n"
     "微博检测 - 立即检查一轮（管理员）\n"
     "微博状态 - 查看运行状态\n"
     "WebUI 控制面板：AstrBot 管理面板 - 插件 - 本插件详情页打开"
@@ -582,6 +587,58 @@ def _parse_album_rules(raw_rules) -> dict[tuple[str, str], str]:
         if uid.isdigit() and gid.isdigit() and album:
             rules[(uid, gid)] = album
     return rules
+
+
+def _parse_keyword_rules(raw_rules) -> list[tuple[str | None, str, str, str]]:
+    """album_keyword_rules 配置列表 → [(uid或None, 关键词, 群号, 相册名或ID)]，保持配置顺序。
+
+    条目格式：全局「关键词:群号:相册」；博主「uid:关键词:群号:相册」（uid=None 表示
+    全局）。相册名可含冒号与空格（尾段原样拼接），关键词不可含冒号。区分依据：
+    4 段且第 1、3 段均为纯数字 → 博主规则；否则第 2 段为纯数字 → 全局规则。格式
+    非法（含关键词为空）的条目静默跳过，与 _parse_album_rules 的容错口径一致。
+    """
+    rules: list[tuple[str | None, str, str, str]] = []
+    for item in raw_rules or []:
+        parts = str(item).strip().split(":")
+        uid: str | None = None
+        if len(parts) >= 4 and parts[0].isdigit() and parts[2].isdigit():
+            uid, kw, gid = parts[0], parts[1].strip(), parts[2]
+            album = ":".join(parts[3:]).strip()
+        elif len(parts) >= 3 and parts[1].isdigit():
+            kw, gid = parts[0].strip(), parts[1]
+            album = ":".join(parts[2:]).strip()
+        else:
+            continue
+        if kw and gid.isdigit() and album:
+            rules.append((uid, kw, gid, album))
+    return rules
+
+
+def _keyword_rules_to_cfg(rules: list[tuple[str | None, str, str, str]]) -> list[str]:
+    """[(uid或None, 关键词, 群号, 相册)] → 配置列表，博主规则带 uid 前缀。"""
+    return [
+        f"{uid}:{kw}:{gid}:{album}" if uid else f"{kw}:{gid}:{album}"
+        for uid, kw, gid, album in rules
+    ]
+
+
+def _keyword_rules_upsert(
+    rules: list[tuple[str | None, str, str, str]],
+    uid: str | None,
+    kw: str,
+    gid: str,
+    album: str,
+) -> bool:
+    """新增/更新关键词规则：同 (范围, 关键词, 群号) 已存在则原位覆盖相册名。
+
+    返回是否为覆盖（False = 新增）。
+    """
+    for i, (u, k, g, _) in enumerate(rules):
+        if u == uid and k == kw and g == gid:
+            rules[i] = (uid, kw, gid, album)
+            return True
+    rules.append((uid, kw, gid, album))
+    return False
 
 
 class _ErrorLogStore(logging.Handler):
@@ -993,6 +1050,8 @@ class WeiboMonitorPlugin(Star):
                 if not isinstance(item.get("video_files"), list):
                     item["video_files"] = []
                 item.setdefault("video_note", "")
+                # v1.7.0 起携带原始正文（关键词相册路由匹配用）；旧条目回退渲染后消息
+                item.setdefault("raw_text", "")
                 pending.append(item)
         self.pending = pending[-PENDING_HARD_LIMIT:]
         self.last_check_ts = float(state.get("last_check_ts") or 0)
@@ -2036,6 +2095,9 @@ class WeiboMonitorPlugin(Star):
                     "post_id": post["id"],
                     "uid": post["uid"],
                     "text": self._build_message(post),
+                    # 关键词相册路由的匹配文本：正文+转发原文（用户改模板去掉
+                    # {weibo} 时渲染消息里就不含原文了，必须留存原始正文）
+                    "raw_text": f"{post['text']}\n{post['orig_text']}",
                     "created_ts": post.get("created_ts", 0.0),
                     "retries": 0,
                     "pics": (post.get("pics") or [])[:max_imgs],
@@ -2550,6 +2612,35 @@ class WeiboMonitorPlugin(Star):
     def _album_rules(self) -> dict[tuple[str, str], str]:
         return _parse_album_rules(self.config.get("album_rules"))
 
+    def _album_keyword_rules(self) -> list[tuple[str | None, str, str, str]]:
+        return _parse_keyword_rules(self.config.get("album_keyword_rules"))
+
+    def _keyword_album_target(self, item: dict[str, Any]) -> tuple[str, str] | None:
+        """关键词相册路由目标：博主规则优先于全局规则，各自按配置顺序第一条命中生效。
+
+        匹配文本为入队时留存的正文+转发原文（旧待办条目回退渲染后消息），语义与
+        关键词过滤一致。返回 (群号, 相册名或ID)；未配置或未命中返回 None——此时
+        上传目标完全按默认相册绑定规则走，与未引入本功能时行为一致。
+        """
+        rules = self._album_keyword_rules()
+        if not rules:
+            return None
+        text = str(item.get("raw_text") or item.get("text") or "")
+        if not text:
+            return None
+        uid = str(item.get("uid") or "")
+        # 第一轮只扫博主规则（uid 匹配的条目），第二轮只扫全局规则：
+        # 保证博主规则优先于全局，与配置里的先后顺序无关
+        for scope_uid, kw, gid, album in rules:
+            if scope_uid is None or scope_uid != uid:
+                continue
+            if kw in text:
+                return gid, album
+        for scope_uid, kw, gid, album in rules:
+            if scope_uid is None and kw in text:
+                return gid, album
+        return None
+
     @staticmethod
     def _parse_umo(umo: str) -> tuple[str, str, str]:
         """拆 unified_msg_origin：platform_id:message_type:session_id。"""
@@ -2577,6 +2668,23 @@ class WeiboMonitorPlugin(Star):
                     f"微博 {item.get('post_id')} 检测到视频、无图片/实况图，"
                     "跳过群相册上传"
                 )
+            return
+        # 关键词路由：博主规则优先于全局规则，命中则图片只传固定群相册、完全
+        # 替代默认绑定；未配置/未命中走原有按群派发逻辑（行为与从前一致）。
+        target = self._keyword_album_target(item)
+        if target:
+            gid, album = target
+            platform = self._parse_umo(sent_sessions[0])[0] if sent_sessions else ""
+            # session 仅作完成通知的落点；platform 未知时通知发不出去，上传不受影响
+            session = f"{platform}:GroupMessage:{gid}" if platform else ""
+            task = asyncio.create_task(
+                self._album_upload_task(session, platform, gid, dict(item), album)
+            )
+            self._album_tasks.add(task)
+            task.add_done_callback(self._bg_task_done(self._album_tasks, "相册上传"))
+            logger.info(
+                f"微博 {item['post_id']} 命中关键词路由，图片改传群 {gid} 相册「{album}」"
+            )
             return
         rules = self._album_rules()
         if not rules:
@@ -3298,6 +3406,12 @@ class WeiboMonitorPlugin(Star):
         lines.append(f"推送目标：{len(sessions)} 个（群内发送 微博绑定 添加）")
         rules = self._album_rules()
         lines.append(f"相册绑定：{len(rules)} 条（微博相册列表 查看）")
+        kw_rules = self._album_keyword_rules()
+        kw_b = sum(1 for u, *_ in kw_rules if u is not None)
+        lines.append(
+            f"关键词路由：博主 {kw_b} 条 / 全局 {len(kw_rules) - kw_b} 条"
+            + ("" if kw_rules else "（未配置时按默认相册绑定上传）")
+        )
         yield event.plain_result("\n".join(lines))
 
     @weibo.command("相册绑定")
@@ -3417,6 +3531,191 @@ class WeiboMonitorPlugin(Star):
             lines.append(f"{idx}. {name}（ID: {aid}）")
         yield event.plain_result("\n".join(lines))
 
+    @weibo.command("关键词相册")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_keyword_album(self, event: AstrMessageEvent, kw: str = ""):
+        """全局关键词路由（管理员）：命中关键词的微博图片只传固定群相册。
+
+        微博关键词相册 <关键词> <群号> <相册名或ID>；群内使用可省略群号
+        """
+        if not kw:
+            yield event.plain_result(
+                "用法：微博关键词相册 <关键词> <群号> <相册名或ID>\n"
+                "群内使用可省略群号：微博关键词相册 <关键词> <相册名或ID>\n"
+                "例如：微博关键词相册 福利 1234567890 福利图集\n"
+                "关键词不可含冒号；命中后图片只传该相册，替代相册绑定规则"
+            )
+            return
+        gid = event.get_group_id()
+        # 相册名可能含空格：以关键词在原始分词中定位，取其后的全部剩余参数
+        # （与 微博相册绑定 的处理方式一致）
+        tokens = re.split(r"\s+", (event.message_str or "").strip())
+        rest: list[str] = []
+        with contextlib.suppress(ValueError):
+            rest = tokens[tokens.index(kw) + 1 :]
+        if rest and rest[0].isdigit():
+            target_gid, album = rest[0], " ".join(rest[1:])
+        elif gid:
+            target_gid, album = str(gid), " ".join(rest)
+        else:
+            yield event.plain_result(
+                "私聊使用必须写明群号：微博关键词相册 <关键词> <群号> <相册名或ID>"
+            )
+            return
+        if not album:
+            yield event.plain_result(
+                "请补上相册名或ID：微博关键词相册 <关键词> <群号> <相册名或ID>\n"
+                "相册可用 微博列相册 查看名称与 ID"
+            )
+            return
+        rules = self._album_keyword_rules()
+        overwritten = _keyword_rules_upsert(rules, None, kw, target_gid, album)
+        self.config["album_keyword_rules"] = _keyword_rules_to_cfg(rules)
+        self.config.save_config()
+        logger.info(
+            f"{PLUGIN_NAME} 关键词路由(全局): 「{kw}」 -> 群 {target_gid} 相册「{album}」"
+        )
+        tip = "（已覆盖同关键词同群的原规则）" if overwritten else ""
+        yield event.plain_result(
+            f"已设置：正文命中「{kw}」的微博图片将只上传到群 {target_gid} "
+            f"相册「{album}」{tip}\n"
+            "仅对该博主生效请用 微博博主关键词相册（博主规则优先）"
+        )
+
+    @weibo.command("关键词相册移除")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_keyword_album_remove(self, event: AstrMessageEvent, kw: str = ""):
+        """删除同名全局关键词路由规则（管理员）：微博关键词相册移除 <关键词>"""
+        if not kw:
+            yield event.plain_result("用法：微博关键词相册移除 <关键词>")
+            return
+        rules = self._album_keyword_rules()
+        removed = [(g, a) for u, k, g, a in rules if u is None and k == kw]
+        if not removed:
+            yield event.plain_result(
+                f"没有关键词「{kw}」的全局规则（微博关键词相册列表 查看；"
+                "博主规则用 微博博主关键词相册移除 删除）"
+            )
+            return
+        rules = [r for r in rules if not (r[0] is None and r[1] == kw)]
+        self.config["album_keyword_rules"] = _keyword_rules_to_cfg(rules)
+        self.config.save_config()
+        logger.info(f"{PLUGIN_NAME} 关键词路由移除(全局): 「{kw}」 -> {removed}")
+        yield event.plain_result(
+            f"已删除 {len(removed)} 条全局规则："
+            + "、".join(f"群 {g} 相册「{a}」" for g, a in removed)
+        )
+
+    @weibo.command("博主关键词相册")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_blogger_keyword_album(
+        self, event: AstrMessageEvent, uid_text: str = "", kw: str = ""
+    ):
+        """博主关键词路由（管理员）：只对该博主生效，优先于全局关键词规则。
+
+        微博博主关键词相册 <uid或链接> <关键词> <群号> <相册名或ID>；群内可省略群号
+        """
+        uid = _extract_uid(uid_text)
+        if not uid or not kw:
+            yield event.plain_result(
+                "用法：微博博主关键词相册 <uid或链接> <关键词> <群号> <相册名或ID>\n"
+                "群内使用可省略群号：微博博主关键词相册 <uid> <关键词> <相册名或ID>\n"
+                "例如：微博博主关键词相册 1234567890 福利 9876543210 福利图集"
+            )
+            return
+        self._sync_accounts_from_config()
+        if uid not in self.accounts:
+            yield event.plain_result(
+                f"账号 {uid} 不在监控列表中，请先用 微博添加 添加，或用 微博列表 查看"
+            )
+            return
+        gid = event.get_group_id()
+        tokens = re.split(r"\s+", (event.message_str or "").strip())
+        rest: list[str] = []
+        with contextlib.suppress(ValueError):
+            rest = tokens[tokens.index(kw) + 1 :]
+        if rest and rest[0].isdigit():
+            target_gid, album = rest[0], " ".join(rest[1:])
+        elif gid:
+            target_gid, album = str(gid), " ".join(rest)
+        else:
+            yield event.plain_result(
+                "私聊使用必须写明群号：微博博主关键词相册 <uid> <关键词> <群号> <相册名或ID>"
+            )
+            return
+        if not album:
+            yield event.plain_result(
+                "请补上相册名或ID：微博博主关键词相册 <uid> <关键词> <群号> <相册名或ID>"
+            )
+            return
+        rules = self._album_keyword_rules()
+        overwritten = _keyword_rules_upsert(rules, uid, kw, target_gid, album)
+        self.config["album_keyword_rules"] = _keyword_rules_to_cfg(rules)
+        self.config.save_config()
+        name = self.accounts[uid]["name"]
+        logger.info(
+            f"{PLUGIN_NAME} 关键词路由(博主 {uid}): 「{kw}」 -> 群 {target_gid} "
+            f"相册「{album}」"
+        )
+        tip = "（已覆盖同关键词同群的原规则）" if overwritten else ""
+        yield event.plain_result(
+            f"已设置：{name}（{uid}）的微博正文命中「{kw}」时，图片将只上传到"
+            f"群 {target_gid} 相册「{album}」{tip}"
+        )
+
+    @weibo.command("博主关键词相册移除")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def weibo_blogger_keyword_album_remove(
+        self, event: AstrMessageEvent, uid_text: str = "", kw: str = ""
+    ):
+        """删除指定博主的关键词路由规则（管理员）：微博博主关键词相册移除 <uid> <关键词>"""
+        uid = _extract_uid(uid_text)
+        if not uid or not kw:
+            yield event.plain_result("用法：微博博主关键词相册移除 <uid> <关键词>")
+            return
+        rules = self._album_keyword_rules()
+        removed = [(g, a) for u, k, g, a in rules if u == uid and k == kw]
+        if not removed:
+            yield event.plain_result(
+                f"账号 {uid} 没有关键词「{kw}」的规则（微博关键词相册列表 查看）"
+            )
+            return
+        rules = [r for r in rules if not (r[0] == uid and r[1] == kw)]
+        self.config["album_keyword_rules"] = _keyword_rules_to_cfg(rules)
+        self.config.save_config()
+        logger.info(f"{PLUGIN_NAME} 关键词路由移除(博主 {uid}): 「{kw}」 -> {removed}")
+        yield event.plain_result(
+            f"已删除 {len(removed)} 条规则："
+            + "、".join(f"群 {g} 相册「{a}」" for g, a in removed)
+        )
+
+    @weibo.command("关键词相册列表")
+    async def weibo_keyword_album_list(self, event: AstrMessageEvent):
+        """查看关键词相册路由规则（博主规则优先于全局规则）"""
+        rules = self._album_keyword_rules()
+        if not rules:
+            yield event.plain_result(
+                "未配置关键词路由：图片按默认相册绑定上传（微博相册列表 查看）。\n"
+                "设置全局规则：微博关键词相册 <关键词> <群号> <相册名或ID>\n"
+                "设置博主规则：微博博主关键词相册 <uid> <关键词> <群号> <相册名或ID>"
+            )
+            return
+        blogger = [(u, k, g, a) for u, k, g, a in rules if u is not None]
+        glob = [(k, g, a) for u, k, g, a in rules if u is None]
+        lines = ["关键词相册路由规则（博主规则优先于全局，第一条命中生效）："]
+        if blogger:
+            lines.append("博主规则：")
+            for idx, (uid, kw, gid, album) in enumerate(blogger, 1):
+                name = self.accounts.get(uid, {}).get("name") or uid
+                lines.append(
+                    f"{idx}. {name}（{uid}）命中「{kw}」→ 群 {gid} 相册「{album}」"
+                )
+        if glob:
+            lines.append("全局规则：")
+            for idx, (kw, gid, album) in enumerate(glob, 1):
+                lines.append(f"{idx}. 命中「{kw}」→ 群 {gid} 相册「{album}」")
+        yield event.plain_result("\n".join(lines))
+
     @weibo.command("检测")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def weibo_check(self, event: AstrMessageEvent):
@@ -3455,6 +3754,12 @@ class WeiboMonitorPlugin(Star):
         lines.append(f"监控账号：{len(self.accounts)} 个")
         lines.append(f"推送目标：{len(self._sessions())} 个")
         lines.append(f"待推送/重试：{len(self.pending)} 条")
+        kw_rules = self._album_keyword_rules()
+        kw_b = sum(1 for u, *_ in kw_rules if u is not None)
+        lines.append(
+            f"关键词路由：博主 {kw_b} 条 / 全局 {len(kw_rules) - kw_b} 条"
+            + ("" if kw_rules else "（未配置时按默认相册绑定上传）")
+        )
         if time.time() < self._blocked_until:
             remain = int((self._blocked_until - time.time()) // 60) + 1
             lines.append(f"风控状态：冷却中（约 {remain} 分钟后恢复）")

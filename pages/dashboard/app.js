@@ -360,6 +360,52 @@ function renderRules(rules) {
   renderListEmpty(tbody, els["rules-empty"], rules.length);
 }
 
+function renderKeywordRules(rules) {
+  els["kw-rules-count"].textContent = String(rules.length);
+  const tbody = els["kw-rule-rows"];
+  tbody.replaceChildren();
+  for (const rule of rules) {
+    const tr = el("tr");
+    const scopeCell = el("td");
+    if (rule.uid) {
+      scopeCell.append(el("span", "", rule.name || rule.uid));
+      scopeCell.append(el("span", "dim", `（${rule.uid}）`));
+    } else {
+      scopeCell.append(el("span", "badge", "全局"));
+    }
+    tr.append(
+      scopeCell,
+      el("td", "", rule.keyword),
+      el("td", "", rule.gid),
+      el("td", "", rule.album)
+    );
+    const op = el("td", "col-op");
+    const rm = el("button", "btn-mini", "移除");
+    rm.type = "button";
+    rm.addEventListener("click", async () => {
+      const confirmed = await confirmDialog(
+        `确定移除该关键词路由吗？\n${rule.name || "全局"} 命中「${rule.keyword}」→ 群 ${rule.gid} 相册「${rule.album}」`
+      );
+      if (!confirmed) return;
+      act(
+        rm,
+        "keyword-rules",
+        {
+          action: "remove",
+          uid: rule.uid || "",
+          keyword: rule.keyword,
+          gid: rule.gid,
+        },
+        () => setStatus("已移除关键词路由规则", "ok")
+      );
+    });
+    op.append(rm);
+    tr.append(op);
+    tbody.append(tr);
+  }
+  renderListEmpty(tbody, els["kw-rules-empty"], rules.length);
+}
+
 function renderPending(pending, totalCount) {
   els["pending-count"].textContent = String(totalCount);
   const tbody = els["pending-rows"];
@@ -471,6 +517,7 @@ function renderOverview(data) {
   renderAccounts(data.accounts || []);
   renderSessions(data.sessions || []);
   renderRules(data.album_rules || []);
+  renderKeywordRules(data.keyword_rules || []);
   renderPending(data.pending || [], (data.status || {}).pending_count || 0);
   renderStats(data.stats || {});
   renderActivity(data.activity || []);
@@ -577,6 +624,28 @@ function wireForms() {
       els["rule-uid"].value = "";
       els["rule-gid"].value = "";
       els["rule-album"].value = "";
+    });
+  });
+
+  els["kw-rule-form"].addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const body = {
+      action: "add",
+      uid: els["kw-rule-uid"].value.trim(),
+      keyword: els["kw-rule-keyword"].value.trim(),
+      gid: els["kw-rule-gid"].value.trim(),
+      album: els["kw-rule-album"].value.trim(),
+    };
+    if (!body.keyword || !body.gid || !body.album) {
+      setStatus("添加关键词路由需要填写关键词、群号、相册名（博主 uid 选填）", "warning");
+      return;
+    }
+    act(ev.submitter, "keyword-rules", body, () => {
+      setStatus("已添加关键词路由规则", "ok");
+      els["kw-rule-uid"].value = "";
+      els["kw-rule-keyword"].value = "";
+      els["kw-rule-gid"].value = "";
+      els["kw-rule-album"].value = "";
     });
   });
 

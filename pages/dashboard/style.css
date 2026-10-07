@@ -309,6 +309,9 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   margin-bottom: 12px;
 }
 
+/* 关键词路由表单多一个 uid（选填）输入 */
+.kw-rule-form { grid-template-columns: 1.2fr 1fr 1fr 1.2fr auto; }
+
 @media (max-width: 720px) { .rule-form { grid-template-columns: 1fr 1fr; } }
 
 /* ---------- 表格 ---------- */

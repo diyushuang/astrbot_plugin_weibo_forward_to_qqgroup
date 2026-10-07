@@ -70,6 +70,25 @@
   </section>
 
   <section class="card">
+    <h2>关键词路由规则 <span class="count" id="kw-rules-count">0</span></h2>
+    <form id="kw-rule-form" class="rule-form kw-rule-form">
+      <input id="kw-rule-uid" type="text" placeholder="博主 uid（留空=全局）" autocomplete="off">
+      <input id="kw-rule-keyword" type="text" placeholder="关键词" autocomplete="off">
+      <input id="kw-rule-gid" type="text" placeholder="群号" autocomplete="off">
+      <input id="kw-rule-album" type="text" placeholder="相册名或 ID" autocomplete="off">
+      <button class="btn primary" type="submit">添加</button>
+    </form>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>范围</th><th>关键词</th><th>群号</th><th>相册</th><th class="col-op"></th></tr></thead>
+        <tbody id="kw-rule-rows"></tbody>
+      </table>
+      <p class="empty" id="kw-rules-empty">未配置关键词路由，图片按上方默认相册绑定上传。配置后，命中关键词的微博图片只传到固定群相册；博主规则优先于全局规则。</p>
+    </div>
+    <p class="hint">博主规则的 uid 须已在监控列表中；关键词不可包含冒号；同（范围+关键词+群号）再次添加会覆盖相册。</p>
+  </section>
+
+  <section class="card">
     <h2>待推送队列 <span class="count" id="pending-count">0</span></h2>
     <div class="table-wrap">
       <table class="table">
@@ -122,6 +141,7 @@
           <li>准实时轮询：默认 120 秒一轮（最小 30 秒），逐账号检查新微博并推送到绑定的群</li>
           <li>推送带图：消息附带轻量图（mw2000），转发微博也会推送，支持屏蔽词/白名单/时效过滤</li>
           <li>群相册：按博主绑定相册，原图自动上传（实况图转 GIF 需 ffmpeg），台账去重防重复</li>
+          <li>关键词路由：命中关键词的微博图片只传固定群相册（全局或按博主），博主规则优先，未配置时按默认绑定</li>
           <li>可靠性：失败重试补推、风控自愈（418/432 全局冷却梯度）、基线防历史刷屏、状态持久化</li>
         </ul>
         <h3>聊天指令</h3>
@@ -132,6 +152,9 @@
             <tr><td>微博列表</td><td>查看监控账号与推送目标</td></tr>
             <tr><td>微博相册绑定 &lt;uid&gt; &lt;相册名或ID&gt; / 微博相册移除 &lt;uid&gt;</td><td>绑定/解除博主图片上传到本群相册（管理员）</td></tr>
             <tr><td>微博相册列表 / 微博列相册</td><td>查看相册绑定规则 / 查看本群相册（管理员）</td></tr>
+            <tr><td>微博关键词相册 &lt;关键词&gt; &lt;群号&gt; &lt;相册名或ID&gt; / 微博关键词相册移除 &lt;关键词&gt;</td><td>设置/删除全局关键词路由（管理员，群内可省群号）</td></tr>
+            <tr><td>微博博主关键词相册 &lt;uid&gt; &lt;关键词&gt; &lt;群号&gt; &lt;相册名或ID&gt; / 微博博主关键词相册移除 &lt;uid&gt; &lt;关键词&gt;</td><td>设置/删除博主关键词路由，优先于全局（管理员）</td></tr>
+            <tr><td>微博关键词相册列表</td><td>查看关键词路由规则</td></tr>
             <tr><td>微博检测 / 微博状态</td><td>立即检查一轮（管理员）/ 查看运行状态</td></tr>
           </tbody>
         </table>

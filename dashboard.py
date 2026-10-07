@@ -93,6 +93,12 @@ def register_dashboard(
         (f"/{plugin_name}/accounts", api.accounts, ["POST"], "增删监控博主"),
         (f"/{plugin_name}/sessions", api.sessions, ["POST"], "增删推送目标"),
         (f"/{plugin_name}/album-rules", api.album_rules, ["POST"], "增删相册规则"),
+        (
+            f"/{plugin_name}/keyword-rules",
+            api.keyword_rules,
+            ["POST"],
+            "增删关键词相册路由规则",
+        ),
     )
     ok = False
     for route, handler, methods, desc in routes:
@@ -164,6 +170,17 @@ class DashboardAPI:
             for (uid, gid), album in rules.items()
         ]
 
+        keyword_rules = [
+            {
+                "uid": uid or "",
+                "name": p._account_name(uid) if uid else "全局",
+                "keyword": kw,
+                "gid": gid,
+                "album": album,
+            }
+            for uid, kw, gid, album in p._album_keyword_rules()
+        ]
+
         pending = [
             {
                 "post_id": str(item.get("post_id") or ""),
@@ -221,6 +238,7 @@ class DashboardAPI:
                 "accounts": accounts,
                 "sessions": p._sessions(),
                 "album_rules": album_rules,
+                "keyword_rules": keyword_rules,
                 "pending": pending,
                 "stats": p.stats,
                 "activity": activity,
@@ -383,4 +401,79 @@ class DashboardAPI:
             p.config.save_config()
             p._record_event("info", uid=uid, detail=f"面板移除相册绑定：群 {gid}")
             return json_response({"removed": f"{uid}:{gid}"})
+        return error_response("不支持的操作")
+
+    async def keyword_rules(self):
+        """关键词相册路由规则的增删。uid 为空表示全局规则，非空表示博主规则。"""
+        p = self.p
+        body = await self._body()
+        action = str(body.get("action") or "")
+        if action == "add":
+            raw_uid = str(body.get("uid") or "").strip()
+            keyword = str(body.get("keyword") or "").strip()
+            gid = str(body.get("gid") or "").strip()
+            album = str(body.get("album") or "").strip()
+            if not keyword or not gid or not album:
+                return error_response("需要关键词、群号、相册名（或 ID）")
+            if ":" in keyword:
+                return error_response("关键词不能包含冒号")
+            if not gid.isdigit():
+                return error_response("群号应为纯数字")
+            uid = ""
+            if raw_uid:
+                uid = self._extract_uid(raw_uid) or ""
+                if not uid:
+                    return error_response(
+                        "博主 uid 无法识别（填纯数字或主页链接，留空表示全局规则）"
+                    )
+                p._sync_accounts_from_config()
+                if uid not in p.accounts:
+                    return error_response(f"账号 {uid} 不在监控列表中，请先添加监控")
+            uid = uid or None  # 全局规则统一存 None，与 _parse_keyword_rules 一致
+            rules = p._album_keyword_rules()
+            for i, (u, k, g, _) in enumerate(rules):
+                if u == uid and k == keyword and g == gid:
+                    rules[i] = (uid, keyword, gid, album)
+                    break
+            else:
+                rules.append((uid, keyword, gid, album))
+            p.config["album_keyword_rules"] = [
+                f"{u}:{k}:{g}:{a}" if u else f"{k}:{g}:{a}" for u, k, g, a in rules
+            ]
+            p.config.save_config()
+            scope = f"博主 {uid}" if uid else "全局"
+            p._record_event(
+                "info",
+                uid=uid or "",
+                name=p._account_name(uid) if uid else "",
+                detail=f"面板设置关键词路由（{scope}）：「{keyword}」→ 群 {gid} 相册「{album}」",
+            )
+            return json_response(
+                {"uid": uid or "", "keyword": keyword, "gid": gid, "album": album}
+            )
+        if action == "remove":
+            uid = str(body.get("uid") or "").strip() or None
+            keyword = str(body.get("keyword") or "").strip()
+            gid = str(body.get("gid") or "").strip()
+            rules = p._album_keyword_rules()
+            if not any(
+                u == uid and k == keyword and g == gid for u, k, g, _ in rules
+            ):
+                return error_response("该规则不存在（可能已被移除）")
+            rules = [
+                r
+                for r in rules
+                if not (r[0] == uid and r[1] == keyword and r[2] == gid)
+            ]
+            p.config["album_keyword_rules"] = [
+                f"{u}:{k}:{g}:{a}" if u else f"{k}:{g}:{a}" for u, k, g, a in rules
+            ]
+            p.config.save_config()
+            scope = f"博主 {uid}" if uid else "全局"
+            p._record_event(
+                "info",
+                uid=uid or "",
+                detail=f"面板移除关键词路由（{scope}）：「{keyword}」群 {gid}",
+            )
+            return json_response({"removed": f"{uid or ''}:{keyword}:{gid}"})
         return error_response("不支持的操作")
