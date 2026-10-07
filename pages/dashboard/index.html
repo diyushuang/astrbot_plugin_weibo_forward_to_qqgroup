@@ -103,6 +103,16 @@
   </section>
 
   <section class="card">
+    <h2>错误日志留存
+      <span class="count err" id="errors-count" hidden>0</span>
+      <button id="btn-clear-errors" class="btn-mini card-action" type="button">清空</button>
+    </h2>
+    <ul class="activity errlog" id="errors-list"></ul>
+    <p class="empty" id="errors-empty">没有错误记录。插件的发送超时、检查失败、相册上传失败、风控冷却等告警都会在这里留存。</p>
+    <p class="hint">每条告警在产生的瞬间落盘（errors.log，512KB 自动轮转），服务器崩溃或无响应后重启，这里仍能看到出事前的最后记录；时间带"重启回读"标记的是上次运行留下的。</p>
+  </section>
+
+  <section class="card">
     <details class="about">
       <summary>功能与指令说明</summary>
       <div class="about-body">

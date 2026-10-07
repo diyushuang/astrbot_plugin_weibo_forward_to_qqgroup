@@ -446,3 +446,22 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   font-size: 11px;
   padding-top: 4px;
 }
+
+/* ---------- 错误日志留存 ---------- */
+
+.count.err { color: var(--err); border-color: var(--err); background: var(--err-bg); }
+
+.card-action { margin-left: auto; }
+
+.act-dot.err { background: var(--err); }
+.act-dot.warn { background: var(--warn); }
+.act-kind.err { color: var(--err); }
+.act-kind.warn { color: var(--warn); }
+
+/* 告警消息可能来自异常 repr，带换行与长串：可折行、不撑破布局 */
+.errlog .act-text {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+  color: var(--text);
+}

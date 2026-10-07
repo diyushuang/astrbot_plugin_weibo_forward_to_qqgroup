@@ -15,6 +15,12 @@ const KIND_LABEL = {
   info: "事件",
 };
 
+const LEVEL_LABEL = {
+  ERROR: "错误",
+  CRITICAL: "严重",
+  WARNING: "警告",
+};
+
 const els = {};
 for (const id of document.querySelectorAll("[id]")) els[id.id] = id;
 
@@ -191,8 +197,59 @@ function renderStatus(st) {
           : "ffmpeg 缺失，实况图仅传封面静图"
         : "在插件配置面板开启",
       st.album_enabled ? "ok" : ""
-    )
+    ),
+    renderMemTile(st.mem),
+    renderDiskTile(st.disk),
+    renderTasksTile(st.bg_tasks)
   );
+}
+
+function renderMemTile(mem) {
+  if (!mem || !mem.total_mb) {
+    return tile("服务器内存", "—", "当前环境读不到内存水位", "");
+  }
+  const free = mem.available_mb;
+  const total = mem.total_mb;
+  // 两次"服务器无响应"都是内存顶穿：<512MB 视为危险，<1GB 提示留意
+  const tone = free < 512 ? "err" : free < 1024 ? "warn" : "ok";
+  return tile(
+    "服务器内存",
+    `${fmtMB(free)} 可用`,
+    `共 ${fmtMB(total)} · 已用 ${Math.round(((total - free) / total) * 100)}%`,
+    tone
+  );
+}
+
+function renderDiskTile(disk) {
+  if (!disk || !disk.total_mb) {
+    return tile("磁盘余量", "—", "数据目录所在盘", "");
+  }
+  // 插件媒体下载有 1GB 保护线，余量逼近它就该清盘了
+  const tone = disk.free_mb < 1024 ? "err" : disk.free_mb < 2048 ? "warn" : "";
+  return tile(
+    "磁盘余量",
+    fmtMB(disk.free_mb),
+    `共 ${fmtMB(disk.total_mb)} · 媒体下载/视频缓存落盘位置`,
+    tone
+  );
+}
+
+function renderTasksTile(bg) {
+  const video = (bg && bg.video_download) || 0;
+  const album = (bg && bg.album_upload) || 0;
+  const n = video + album;
+  return tile(
+    "后台任务",
+    n ? `${n} 个在途` : "空闲",
+    video || album
+      ? `视频下载 ${video} · 相册上传 ${album}`
+      : "无在途的视频下载与相册上传",
+    n ? "warn" : ""
+  );
+}
+
+function fmtMB(mb) {
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`;
 }
 
 function renderListEmpty(listEl, emptyEl, count) {
@@ -310,11 +367,16 @@ function renderPending(pending, totalCount) {
   for (const item of pending) {
     const tr = el("tr");
     tr.append(el("td", "", item.name || item.uid || "—"));
-    tr.append(el("td", "dim", item.text || "（无内容）"));
+    const textCell = el("td");
+    if (item.video) textCell.append(el("span", "badge", "含视频"));
+    if (item.text) textCell.append(el("span", "dim", item.text));
+    else if (!item.video) textCell.append(el("span", "dim", "（无内容）"));
+    tr.append(textCell);
     tr.append(el("td", "dim", item.created_ts ? fmtTime(item.created_ts) : "—"));
     const retry = el("td");
+    if (item.sending) retry.append(el("span", "badge warn", "发送中"));
     if (item.retries > 0) retry.append(el("span", "danger", `${item.retries} 次`));
-    else retry.append(el("span", "dim", "—"));
+    else if (!item.sending) retry.append(el("span", "dim", "—"));
     tr.append(retry);
     tbody.append(tr);
   }
@@ -415,6 +477,32 @@ function renderOverview(data) {
   els["album-disabled-tip"].hidden = !!(data.status || {}).album_enabled;
 }
 
+function renderErrors(items) {
+  els["errors-count"].hidden = items.length === 0;
+  els["errors-count"].textContent = String(items.length);
+  const list = els["errors-list"];
+  list.replaceChildren();
+  for (const item of items) {
+    const li = el("li");
+    const level = item.level === "WARNING" ? "warn" : "err";
+    li.append(el("div", `act-dot ${level}`));
+    const body = el("div", "act-body");
+    const line = el("div", "act-line");
+    line.append(
+      el("span", `act-kind ${level}`, LEVEL_LABEL[item.level] || item.level || "告警")
+    );
+    if (item.src) line.append(el("span", "act-name", item.src));
+    if (item.restored) line.append(el("span", "badge", "上次运行"));
+    body.append(line);
+    body.append(el("div", "act-text", item.msg || ""));
+    li.append(body);
+    li.append(el("span", "act-time", relTime(item.ts)));
+    li.title = item.ts ? fmtTime(item.ts) : "";
+    list.append(li);
+  }
+  els["errors-empty"].hidden = items.length > 0;
+}
+
 /* ---------- 数据加载与操作 ---------- */
 
 async function load() {
@@ -423,6 +511,16 @@ async function load() {
     renderOverview(data);
   } catch (e) {
     setStatus(`加载失败：${e && e.message ? e.message : e}`, "error");
+  }
+  await loadErrors();
+}
+
+async function loadErrors() {
+  try {
+    const data = await window.__bridge.apiGet("errors");
+    renderErrors(data.errors || []);
+  } catch (e) {
+    // 错误留存读取失败不打断面板其它区块
   }
 }
 
@@ -496,6 +594,15 @@ function wireForms() {
   });
 
   els["btn-refresh"].addEventListener("click", () => load());
+
+  els["btn-clear-errors"].addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget;
+    const confirmed = await confirmDialog(
+      "确定清空错误日志留存吗？\n内存缓冲与 errors.log 将一并清掉，仅建议在问题处理完后操作。"
+    );
+    if (!confirmed) return;
+    act(btn, "clear-errors", {}, () => setStatus("已清空错误日志留存", "ok"));
+  });
 }
 
 /* ---------- 初始化 ---------- */

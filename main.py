@@ -7,11 +7,13 @@ import hashlib
 import html as html_lib
 import ipaddress
 import json
+import logging
 import os
 import random
 import re
 import shutil
 import socket
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -21,7 +23,7 @@ from urllib.parse import quote, urlparse, urlunparse
 
 import aiohttp
 
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Video
 from astrbot.api.star import Context, Star, StarTools
@@ -44,7 +46,12 @@ from .napcat_album import (
 from .dashboard import register_dashboard
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.6.1"
+PLUGIN_VERSION = "v1.6.3"
+
+# 插件专属子日志器：挂在 astrbot 命名空间下，继承 AstrBot 的处理器与有效级别
+# （主日志照常输出），同时让"错误留存 Handler"只挂在本插件名下——不会把其它
+# 插件的告警也收进留存，重载时也能精确摘除
+logger = logging.getLogger(f"astrbot.plugins.{PLUGIN_NAME}")
 
 WEIBO_HOME_URL = "https://m.weibo.cn/"
 WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"
@@ -132,6 +139,13 @@ BAD_NAME_RE = re.compile(r'[\\/:*?"<>|\s]+')
 # 的状态（与 astrbot_plugin_weibo_album 的 diagnostic.log 同一套做法）
 DIAG_FILE = "diagnostic.log"
 DIAG_MAX_BYTES = 512 * 1024  # 诊断文件轮转阈值：超限只留后半段
+# 错误留存：本插件所有 warning/error 逐条立即 fsync 落盘并进内存环形缓冲，
+# 面板可查。整机被内存顶死时主日志来不及刷盘，诊断文件只覆盖相册重负载动作，
+# 这份文件补上"死机前最后在报什么告警"（发送超时、检查失败、风控冷却……）
+ERRLOG_FILE = "errors.log"
+ERRLOG_MAX_BYTES = 512 * 1024  # 轮转阈值：超限只留后半段
+ERRLOG_BUFFER = 200  # 内存环形缓冲条数（面板展示上限，重启后从文件尾部回读）
+ERRLOG_PAGE_LIMIT = 50  # 面板单次返回条数
 GIF_MAX_BYTES = 30 * 1024 * 1024  # 实况图 GIF 产物上限：超限回落封面静图，防超大 GIF
 SINAIMG_RE = re.compile(
     r"(https?:)?//([a-z0-9]+)\.sinaimg\.cn/([a-z0-9]+)/([0-9a-zA-Z]+)\.(\w+)", re.I
@@ -140,6 +154,12 @@ SINAIMG_RE = re.compile(
 # ---------------- 视频转发 ----------------
 VIDEO_TMP_DIR = "video_tmp"  # 视频推送的临时下载目录（插件数据目录下），发完即删
 VIDEO_MAX_MB_DEFAULT = 95  # 单视频下载/发送体积上限默认值：QQ 视频消息硬限 100MB，留出余量
+# base64 内嵌发送的体积上限默认值：base64 一路上是文件体积的 5~6 倍瞬时内存
+# （读入字节 + 编码串 + 载荷串 + JSON 序列化，插件与协议端两侧各来一遍），
+# 95MB 的视频就是 500MB 级的内存尖峰，小内存服务器直接被顶死（整机无响应、
+# 之后超时重发再撞上重复推送，都是它的连锁反应）。30MB 约对应 160MB 级尖峰，
+# 是 1~2GB 内存机器能安全消化的量级
+VIDEO_INLINE_MB_DEFAULT = 30
 VIDEO_DL_TIMEOUT = 300.0  # 单个视频下载总超时（秒）：几十上百 MB 的文件比图片慢得多
 # 含视频消息的发送超时下限：视频上传 QQ 比九张图还慢，沿用图片的 60s 常常
 # "实际已发出但被判超时"，重试会让群里重复出现同一条视频
@@ -353,12 +373,19 @@ def _abs_https(url: str) -> str:
     return url
 
 
-def _video_candidates(mi: dict[str, Any], prefer_hd: bool) -> list[str]:
+def _video_candidates(
+    mi: dict[str, Any], prefer_hd: bool, max_bytes: int | float = 0
+) -> list[str]:
     """从 media_info 提取有序的 mp4 直链候选。
 
     优先取新版多码率数组 playback_list 里的 mp4 档（m3u8 是 HLS 切片，
     QQ 视频消息吃不了），hd 按清晰度降序、sd 升序；其后是旧版字段的
     降级链。返回的每个 URL 都可直接下载，签名会过期，拿到就要马上用。
+
+    max_bytes 非零时按 playback_list 自带的体积元数据把候选分桶排序：
+    体积适配 cap 的排最前——内嵌发送有体积帽，宁可给用户 720p 的视频也别
+    先把 1080p 下到一半才发现超帽白白烧一遍带宽（体积未知的候选仍按原
+    顺序跟在后面，已知超帽的垫底；真实体积以下载时的实际拦截为准）。
     """
     cands: list[str] = []
     seen: set[str] = set()
@@ -386,7 +413,14 @@ def _video_candidates(mi: dict[str, Any], prefer_hd: bool) -> list[str]:
             seen.add(url)
             playlist.append((width, size, url))
     playlist.sort(key=lambda t: (t[0], t[1]), reverse=prefer_hd)
-    cands.extend(u for _, _, u in playlist)
+    if 0 < max_bytes < float("inf"):
+        fits = [t for t in playlist if t[1] and t[1] <= max_bytes]
+        unknown = [t for t in playlist if not t[1]]
+        overs = [t for t in playlist if t[1] and t[1] > max_bytes]
+        cands.extend(u for _, _, u in fits)
+        cands.extend(u for _, _, u in unknown)
+    else:
+        cands.extend(u for _, _, u in playlist)
     for key in (
         "replay_hd",
         "stream_url_hd",
@@ -401,6 +435,8 @@ def _video_candidates(mi: dict[str, Any], prefer_hd: bool) -> list[str]:
         if url and url not in seen and not url.lower().split("?")[0].endswith(".m3u8"):
             seen.add(url)
             cands.append(url)
+    if 0 < max_bytes < float("inf"):
+        cands.extend(u for _, _, u in overs)
     return cands
 
 
@@ -527,6 +563,90 @@ def _parse_album_rules(raw_rules) -> dict[tuple[str, str], str]:
     return rules
 
 
+class _ErrorLogStore(logging.Handler):
+    """本插件 warning/error 的留存器：内存环形缓冲 + errors.log 逐条立即 fsync。
+
+    整机被内存顶死后主日志往往来不及刷盘，diagnostic.log 只覆盖相册重负载
+    动作；这里把发送超时、检查失败、相册上传失败、风控冷却等所有告警在产生
+    的瞬间落盘，重启后面板仍能还原"死机前最后在报什么"。写入在日志调用的
+    线程里同步完成——告警是低频事件，几毫秒的 fsync 换确定性留存值得。
+    JSONL 一行一条（msg 里的换行会被转义），重启后按行回读进缓冲。
+    挂在插件专属子日志器上，只收本插件的告警；异常绝不外抛（留存本身不能
+    变成新的故障点），磁盘满/读不动时静默放弃。
+    """
+
+    def __init__(self, path: Path, buffer_size: int = ERRLOG_BUFFER):
+        super().__init__(level=logging.WARNING)
+        self._path = path
+        self._buf: deque[dict[str, Any]] = deque(maxlen=buffer_size)
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            entry = {
+                "ts": record.created,
+                "level": record.levelname,
+                "src": f"{record.funcName}:{record.lineno}",
+                "msg": record.getMessage(),
+            }
+        except Exception:
+            return
+        with self._lock:
+            self._buf.append(entry)
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    self._path.exists()
+                    and self._path.stat().st_size > ERRLOG_MAX_BYTES
+                ):
+                    lines = self._path.read_text(encoding="utf-8").splitlines(True)
+                    self._path.write_text(
+                        "".join(lines[len(lines) // 2 :]), encoding="utf-8"
+                    )
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                pass
+
+    def restore(self) -> int:
+        """启动时回读文件尾部，重启后面板还能看到上一次崩溃前的告警。"""
+        try:
+            lines = self._path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return 0
+        n = 0
+        with self._lock:
+            for line in lines[-ERRLOG_BUFFER:]:
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(item, dict) and item.get("msg"):
+                    item["restored"] = True  # 面板据此显示"上次运行"标记
+                    self._buf.append(item)
+                    n += 1
+        return n
+
+    def snapshot(self, limit: int) -> list[dict[str, Any]]:
+        """最近 limit 条，最新在前（面板直接渲染）。"""
+        with self._lock:
+            items = list(self._buf)
+        return list(reversed(items[-limit:]))
+
+    def clear(self) -> int:
+        """清空缓冲并截断文件，返回清掉的条数。"""
+        with self._lock:
+            n = len(self._buf)
+            self._buf.clear()
+            try:
+                self._path.write_text("", encoding="utf-8")
+            except OSError:
+                pass
+            return n
+
+
 class WeiboMonitorPlugin(Star):
     """免 Cookie 监控微博账号更新，并转发到绑定的Q群。
 
@@ -589,6 +709,7 @@ class WeiboMonitorPlugin(Star):
         self._self_ids: dict[int, str] = {}  # id(bot) -> 登录账号 self_id 缓存
         self._ffmpeg = ""  # ffmpeg 可执行文件路径，initialize 时探测
         self._diag_path: Path | None = None  # 相册上传诊断文件（initialize 时解析）
+        self._errlog: _ErrorLogStore | None = None  # 错误留存（initialize 时挂载）
         # ---- WebUI 控制面板（dashboard.py 注册路由，旧版 AstrBot 自动降级）----
         self._web_ready = False
         self._manual_check_task: asyncio.Task | None = None
@@ -616,6 +737,24 @@ class WeiboMonitorPlugin(Star):
             logger.info(f"{PLUGIN_NAME} 未找到 ffmpeg，实况图将只上传封面静图")
         # 诊断文件随启动记录一份流控配置快照，配置改了对不上号时以它为准
         self._diag_path = self._data_dir / DIAG_FILE
+        # 错误留存：挂上后本插件所有 warning/error 立即落盘，面板可查；
+        # 启动时回读上次运行残留的文件尾部（死机前的告警不丢）。
+        # 先摘掉可能残留的旧实例（异常退出没走 terminate 时防重复挂载）
+        for h in list(logger.handlers):
+            if isinstance(h, _ErrorLogStore):
+                logger.removeHandler(h)
+        self._errlog = _ErrorLogStore(self._data_dir / ERRLOG_FILE)
+        try:
+            logger.addHandler(self._errlog)
+        except Exception:
+            self._errlog = None
+        else:
+            restored = await asyncio.to_thread(self._errlog.restore)
+            if restored:
+                logger.info(
+                    f"错误留存已回读上次运行残留的 {restored} 条告警"
+                    "（面板可查，可能包含崩溃前的最后记录）"
+                )
         await self._diag(
             f"启动 ffmpeg={'有' if self._ffmpeg else '无'} "
             f"album_download_concurrency={self._int_cfg('album_download_concurrency', 5)} "
@@ -677,6 +816,11 @@ class WeiboMonitorPlugin(Star):
         )
 
     async def terminate(self):
+        # 留存 Handler 先摘掉：重载时重复挂载会把每条告警收两遍
+        if self._errlog is not None:
+            with contextlib.suppress(Exception):
+                logger.removeHandler(self._errlog)
+            self._errlog = None
         if self._poll_task:
             self._poll_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -714,14 +858,20 @@ class WeiboMonitorPlugin(Star):
         return [str(s) for s in (self.config.get("push_sessions") or [])]
 
     def _int_cfg(self, key: str, default: int) -> int:
+        v = self.config.get(key)
+        if v is None or v == "":
+            return default
         try:
-            return max(0, int(self.config.get(key) or default))
+            return max(0, int(v))
         except (TypeError, ValueError):
             return default
 
     def _float_cfg(self, key: str, default: float) -> float:
+        v = self.config.get(key)
+        if v is None or v == "":
+            return default
         try:
-            v = float(self.config.get(key) or default)
+            v = float(v)
         except (TypeError, ValueError):
             return default
         return v if v >= 0 else default
@@ -779,8 +929,16 @@ class WeiboMonitorPlugin(Star):
                 "next_retry_ts": 0.0,
             }
         pending: list[dict[str, Any]] = []
+        unverified: list[dict[str, Any]] = []
         for item in state.get("pending") or []:
             if isinstance(item, dict) and item.get("post_id") and item.get("text"):
+                # 发送中途崩溃/重载的条目带着"已开始发送"戳：那次发送的结果
+                # 未知，而大载荷最常见的结局是"实际已送达但判超时/进程被杀"——
+                # 再发一遍就是群里两条一样的消息。宁可漏不可重：跳过并记账，
+                # 真没发出去的场合群里有原帖链接可看
+                if item.get("last_send_ts"):
+                    unverified.append(item)
+                    continue
                 item.setdefault("retries", 0)
                 item.setdefault("created_ts", 0.0)
                 # v1.4.0 起待推送条目携带图片信息，旧状态文件没有该字段
@@ -847,6 +1005,16 @@ class WeiboMonitorPlugin(Star):
                         "detail": str(act.get("detail") or ""),
                     }
                 )
+        # 跳过"发送中"条目的记账要放在动态历史加载之后：_record_push 会写动态，
+        # 提前写会被上面这段覆盖掉
+        for item in unverified:
+            self._record_push(
+                str(item.get("uid") or ""),
+                False,
+                str(item.get("text") or ""),
+                f"重启/重载前正在推送微博 {item.get('post_id')}，发送结果未知，"
+                "为防重复未重发；如群里没收到请点原帖链接",
+            )
         self._prune_stats()
 
     def _save_state(self):
@@ -947,6 +1115,47 @@ class WeiboMonitorPlugin(Star):
             self.stats["by_uid"] = {
                 u: d for u, d in by_uid.items() if u in self.accounts
             }
+
+    # ---------------- 服务器水位（面板展示，均为请求时现算，无后台开销） ----------------
+
+    def _mem_snapshot(self) -> dict[str, int] | None:
+        """当前内存水位 (可用/总量 MB)；读不到（非 Linux/容器未挂载）返回 None。
+
+        前两次"服务器无响应"都是内存顶穿——面板把它亮出来，配合错误留存，
+        死机前最后一眼数据里就有内存余量。
+        """
+        try:
+            info: dict[str, int] = {}
+            with open("/proc/meminfo", encoding="ascii") as fh:
+                for line in fh:
+                    key, _, rest = line.partition(":")
+                    parts = rest.split()
+                    if parts:
+                        info[key.strip()] = int(parts[0])
+            total = info.get("MemTotal", 0) // 1024
+            avail = info.get("MemAvailable", info.get("MemFree", 0)) // 1024
+            return {"total_mb": total, "available_mb": avail} if total else None
+        except (OSError, ValueError):
+            return None
+
+    def _disk_snapshot(self) -> dict[str, int] | None:
+        """插件数据目录所在盘的余量（媒体下载/视频缓存的落盘位置）。"""
+        if self._data_dir is None:
+            return None
+        try:
+            usage = shutil.disk_usage(self._data_dir)
+        except OSError:
+            return None
+        return {
+            "total_mb": usage.total // 1048576,
+            "free_mb": usage.free // 1048576,
+        }
+
+    async def clear_error_log(self) -> int:
+        """清空错误留存（面板按钮），返回清掉的条数。"""
+        if self._errlog is None:
+            return 0
+        return self._errlog.clear()
 
     # ---------------- 网络请求 ----------------
 
@@ -1355,7 +1564,7 @@ class WeiboMonitorPlugin(Star):
 
     @staticmethod
     def _video_nodes(
-        pi: Any, prefer_hd: bool, seen_urls: set[str]
+        pi: Any, prefer_hd: bool, seen_urls: set[str], max_bytes: int | float = 0
     ) -> list[dict[str, Any]]:
         """从 page_info 提取一个视频的直链候选列表；直播中或无 media_info 时返回空。"""
         out: list[dict[str, Any]] = []
@@ -1367,7 +1576,11 @@ class WeiboMonitorPlugin(Star):
         mi = pi.get("media_info")
         if not isinstance(mi, dict):
             return out
-        urls = [u for u in _video_candidates(mi, prefer_hd) if u not in seen_urls]
+        urls = [
+            u
+            for u in _video_candidates(mi, prefer_hd, max_bytes)
+            if u not in seen_urls
+        ]
         seen_urls.update(urls)
         if urls:
             out.append({"urls": urls})
@@ -1385,6 +1598,9 @@ class WeiboMonitorPlugin(Star):
             return
         pid = str(post["id"])
         prefer_hd = str(self.config.get("video_quality") or "hd") != "sd"
+        # 体积帽换算成字节传给候选排序：内嵌发送时优先挑体积适配的档位
+        cap_mb = self._video_download_cap_mb()
+        max_bytes = cap_mb * 1048576 if cap_mb > 0 else 0
         try:
             data = await self._api_get(
                 WEIBO_SHOW_URL,
@@ -1401,21 +1617,31 @@ class WeiboMonitorPlugin(Star):
             return
         videos: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
-        videos.extend(self._video_nodes(detail.get("page_info"), prefer_hd, seen_urls))
+        videos.extend(
+            self._video_nodes(detail.get("page_info"), prefer_hd, seen_urls, max_bytes)
+        )
         mix_pics, mix_medias = _mix_media_nodes(detail)
         for mi in mix_medias:
-            urls = [u for u in _video_candidates(mi, prefer_hd) if u not in seen_urls]
+            urls = [
+                u
+                for u in _video_candidates(mi, prefer_hd, max_bytes)
+                if u not in seen_urls
+            ]
             seen_urls.update(urls)
             if urls:
                 videos.append({"urls": urls})
         rt = detail.get("retweeted_status")
         if isinstance(rt, dict) and not videos:
             # 外层没有视频才看转发原微博（转发时原视频挂在 rt 的结构里）
-            videos.extend(self._video_nodes(rt.get("page_info"), prefer_hd, seen_urls))
+            videos.extend(
+                self._video_nodes(rt.get("page_info"), prefer_hd, seen_urls, max_bytes)
+            )
             _, rt_medias = _mix_media_nodes(rt)
             for mi in rt_medias:
                 urls = [
-                    u for u in _video_candidates(mi, prefer_hd) if u not in seen_urls
+                    u
+                    for u in _video_candidates(mi, prefer_hd, max_bytes)
+                    if u not in seen_urls
                 ]
                 seen_urls.update(urls)
                 if urls:
@@ -1804,10 +2030,23 @@ class WeiboMonitorPlugin(Star):
         if self._videos_enabled():
             note = str(item.get("video_note") or "")
             if with_video:
+                sent_n, refused_n = 0, 0
                 for path in item.get("video_files") or []:
                     p = Path(str(path))
-                    if p.is_file():
-                        chain.chain.append(await self._video_segment(p))
+                    if not p.is_file():
+                        continue
+                    seg = await self._video_segment(p)
+                    if seg is None:
+                        refused_n += 1
+                    else:
+                        chain.chain.append(seg)
+                        sent_n += 1
+                if refused_n:
+                    # 有视频段被内嵌上限拒发：全被拒按"未能转发"提示，部分被拒
+                    # 按"部分未能转发"提示，与下载侧的降级口径一致
+                    note = note or (
+                        VIDEO_FALLBACK_NOTE if not sent_n else VIDEO_PARTIAL_NOTE
+                    )
             elif item.get("video_files"):
                 note = note or VIDEO_FALLBACK_NOTE
             if note:
@@ -1851,6 +2090,38 @@ class WeiboMonitorPlugin(Star):
                 for f in item.get("video_files") or []:
                     Path(str(f)).unlink(missing_ok=True)
                 return
+
+    def _bg_task_done(self, tasks: set, label: str):
+        """后台任务的统一收尾回调：出集合 + 未捕获异常记入错误留存。
+
+        后台任务里漏接的异常以前只会随 Task 对象静默蒸发（除非 GC 时才打一条
+        没上下文的日志），服务器出事后无从追查；这里兜住并走 logger.error，
+        由错误留存 Handler 落盘。
+        """
+
+        def _cb(task: asyncio.Task) -> None:
+            tasks.discard(task)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error(f"{label}后台任务未捕获异常退出: {exc!r}")
+
+        return _cb
+
+    def _mark_sending(self, item: dict[str, Any]) -> None:
+        """发送前打"已开始发送"时间戳；视频条目立即落盘。
+
+        条目要等发送成功返回才出队，而这中间的窗口里进程崩溃/插件重载的话，
+        state.json 里还留着它——不打戳，重启后会原样重发，群里就是两条一样
+        的消息。视频条目的发送窗口可达分钟级且正是内存吃紧的时段，是重发
+        事故的主体，所以只有它强制立即落盘；纯图文发送快，随下一次防抖落盘。
+        打过戳的条目在重启/重载后按"结果未知"跳过重发（见 _load_state）。
+        """
+        if not item.get("last_send_ts"):
+            item["last_send_ts"] = time.time()
+            if item.get("video_files"):
+                self._save_state()
 
     async def _flush_pending(self) -> bool:
         """把待推送队列发送到所有绑定的会话，返回本轮是否有需落盘的状态变化。
@@ -1896,10 +2167,12 @@ class WeiboMonitorPlugin(Star):
                 self._ensure_video_prepare(item)
                 continue
             sent_sessions: list[str] = []
+            timed_out_sessions: list[str] = []
             chain = await self._build_chain(item)
             send_timeout = self._int_cfg("message_send_timeout", 60)
             if send_timeout and item.get("video_files"):
                 send_timeout = max(send_timeout, VIDEO_SEND_TIMEOUT_FLOOR)
+            self._mark_sending(item)
             for session in sessions:
                 try:
                     if await self._send_with_timeout(
@@ -1908,6 +2181,16 @@ class WeiboMonitorPlugin(Star):
                         sent_sessions.append(session)
                 except asyncio.CancelledError:
                     raise
+                except TimeoutError:
+                    # 超时不代表没发出去：大载荷最常见的就是"实际已送达但判超时"
+                    # （九图、视频都撞过），帧早已交出去，协议端慢慢传而已。
+                    # 结果未知时该会话不再重发——盲重发就是群里同一条消息出现
+                    # 两遍；其余会话继续逐个尝试，互不连坐。
+                    timed_out_sessions.append(session)
+                    logger.warning(
+                        f"推送到 {session} 超过 {send_timeout} 秒未返回，结果未知："
+                        f"微博 {item['post_id']} 对该会话不再重发（防重复）"
+                    )
                 except Exception as e:
                     logger.warning(f"推送到 {session} 失败: {e!r}")
             if sent_sessions:
@@ -1917,14 +2200,33 @@ class WeiboMonitorPlugin(Star):
                     str(item.get("uid") or ""),
                     True,
                     str(item.get("text") or ""),
-                    f"推送到 {len(sent_sessions)} 个会话",
+                    f"推送到 {len(sent_sessions)} 个会话"
+                    + (
+                        f"，另 {len(timed_out_sessions)} 个会话超时结果未知未重发"
+                        if timed_out_sessions
+                        else ""
+                    ),
                 )
-                self._dispatch_album_uploads(item, sent_sessions)
+                # 超时的会话多半其实已送达，相册上传有自己的台账去重，一并派发
+                self._dispatch_album_uploads(
+                    item, sent_sessions + timed_out_sessions
+                )
                 changed = True
                 now_mono = time.monotonic()
                 if now_mono - last_save >= STATE_SAVE_DEBOUNCE:
                     self._save_state()
                     last_save = now_mono
+            elif timed_out_sessions:
+                self._pending_discard(item)
+                self._record_push(
+                    str(item.get("uid") or ""),
+                    False,
+                    str(item.get("text") or ""),
+                    f"发送超时（{send_timeout}s）结果未知，未重发以防重复；"
+                    "如群里没收到请点原帖链接",
+                )
+                self._dispatch_album_uploads(item, timed_out_sessions)
+                changed = True
             else:
                 item["retries"] = item.get("retries", 0) + 1
                 changed = True
@@ -1945,6 +2247,7 @@ class WeiboMonitorPlugin(Star):
         """
         if not sessions or not self._videos_enabled() or not item.get("video_files"):
             return
+        self._mark_sending(item)
         try:
             chain = await self._build_chain(item, with_video=False)
         except Exception as e:
@@ -1986,20 +2289,62 @@ class WeiboMonitorPlugin(Star):
         except Exception:
             return ""
 
-    async def _video_segment(self, p: Path) -> Video:
+    def _video_inline_cap_mb(self) -> int:
+        """base64 内嵌发送的体积上限（MB），0 表示不限制。
+
+        配置了 callback_api_base 时走本地路径注册回调，没有内存放大，不受此限。
+        """
+        if self._callback_api_base():
+            return 0
+        return self._int_cfg("video_inline_max_mb", VIDEO_INLINE_MB_DEFAULT)
+
+    def _video_download_cap_mb(self) -> int:
+        """视频下载体积上限（MB），0 表示不限制。
+
+        内嵌发送时不能下到 video_max_mb 才发现发不出去：下载帽取发送帽与
+        video_max_mb 中更小的正数。超帽的视频在下载阶段就降级为提示链接，
+        不浪费带宽也不占磁盘。
+        """
+        caps = [
+            c
+            for c in (
+                self._int_cfg("video_max_mb", VIDEO_MAX_MB_DEFAULT),
+                self._video_inline_cap_mb(),
+            )
+            if c > 0
+        ]
+        return min(caps) if caps else 0
+
+    async def _video_segment(self, p: Path) -> Video | None:
         """构造视频段：默认 base64 内嵌，配置了 callback_api_base 才走本地路径。
 
         aiocqhttp 出站时 Image/Record 会被 AstrBot 自动转成 base64 内嵌，Video
         却把 file:// 路径原样透传——NapCat 与 AstrBot 分容器部署（互相看不到
         对方文件系统，Docker 分容器是常态）时，协议端打开这个路径必然 ENOENT，
         整条消息（含正文和图片）一起失败。base64 内嵌与图片同一条路，不依赖
-        任何路径映射或额外配置；代价是发送瞬间内存放大 ~1.33 倍，体积已被
+        任何路径映射或额外配置；代价是发送瞬间内存放大约 1.33 倍，体积已被
         video_max_mb 封顶。配了 callback_api_base 时 to_dict() 会把非 http 的
         file 值交给 register_file 注册成回调下载地址，那条路只认本地文件，
         base64 串会炸，所以保持 fromFileSystem 让 AstrBot 自己去注册。
+
+        超出内嵌上限（video_inline_max_mb）时返回 None，由 _build_chain 附降级
+        提示而不是硬发：正常流程下载帽已拦住超大视频，这里兜的是"发送中途
+        调小上限/旧状态文件残留大文件"的场合——硬发的内存尖峰会顶死小服务器。
         """
         if self._callback_api_base():
             return Video.fromFileSystem(path=str(p))
+        cap_mb = self._video_inline_cap_mb()
+        if cap_mb > 0:
+            try:
+                size_mb = p.stat().st_size / 1048576
+            except OSError:
+                size_mb = 0.0
+            if size_mb > cap_mb:
+                logger.warning(
+                    f"视频 {p.name} {size_mb:.0f}MB 超过 base64 内嵌上限 {cap_mb}MB，"
+                    "跳过视频段改发降级提示（防止内存尖峰顶死服务器）"
+                )
+                return None
         try:
             raw_b64 = await asyncio.to_thread(
                 lambda: base64.b64encode(p.read_bytes()).decode("ascii")
@@ -2042,7 +2387,7 @@ class WeiboMonitorPlugin(Star):
         self._video_preparing.add(post_id)
         task = asyncio.create_task(self._video_prepare(item))
         self._video_tasks.add(task)
-        task.add_done_callback(self._video_tasks.discard)
+        task.add_done_callback(self._bg_task_done(self._video_tasks, "视频下载"))
 
     async def _video_prepare(self, item: dict[str, Any]) -> None:
         """后台下载条目视频到 video_tmp：成功填 video_files，失败填降级提示。
@@ -2055,10 +2400,9 @@ class WeiboMonitorPlugin(Star):
         entries = [v for v in (item.get("videos") or []) if isinstance(v, dict)]
         files: list[str] = []
         try:
-            try:
-                cap_mb = int(self.config.get("video_max_mb"))
-            except (TypeError, ValueError):
-                cap_mb = VIDEO_MAX_MB_DEFAULT
+            # 下载帽取 video_max_mb 与内嵌发送帽的较小正数：内嵌发送时下到
+            # 95MB 才在发送阶段拒发，等于白烧一遍带宽还留了个发不出去的大文件
+            cap_mb = self._video_download_cap_mb()
             max_bytes: int | float = (
                 cap_mb * 1048576 if cap_mb > 0 else float("inf")
             )
@@ -2208,7 +2552,7 @@ class WeiboMonitorPlugin(Star):
                 self._album_upload_task(session, platform, sid, dict(item), want)
             )
             self._album_tasks.add(task)
-            task.add_done_callback(self._album_tasks.discard)
+            task.add_done_callback(self._bg_task_done(self._album_tasks, "相册上传"))
         if hit_any:
             logger.info(f"微博 {item['post_id']} 命中相册绑定规则，开始自动上传图片")
 

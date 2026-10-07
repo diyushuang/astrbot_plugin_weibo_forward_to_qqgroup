@@ -13,10 +13,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any, Callable
-
-from astrbot.api import logger
 
 try:  # 新版 AstrBot：astrbot.api.web 提供请求代理与响应助手
     from astrbot.api.web import error_response, json_response
@@ -67,6 +66,14 @@ except ImportError:  # 旧版 Dashboard 走 Quart 原生上下文，做最小等
 # 面板单次返回的明细条数上限（队列与动态），全量数据在 state.json 里
 PENDING_PAGE_LIMIT = 50
 ACTIVITY_PAGE_LIMIT = 50
+# 错误留存单次返回条数（与 main.py 的 ERRLOG_PAGE_LIMIT 口径一致；不反向
+# import main，这里各自定义，改了要同步）
+ERRLOG_PAGE_LIMIT = 50
+
+
+def _plog(plugin_name: str) -> logging.Logger:
+    """与 main.py 同名的插件子日志器：面板侧的告警同样进错误留存。"""
+    return logging.getLogger(f"astrbot.plugins.{plugin_name}")
 
 
 def register_dashboard(
@@ -84,7 +91,9 @@ def register_dashboard(
     api = DashboardAPI(plugin, plugin_name, version, extract_uid, redact_proxy)
     routes = (
         (f"/{plugin_name}/overview", api.overview, ["GET"], "微博转发面板总览"),
+        (f"/{plugin_name}/errors", api.errors, ["GET"], "错误日志留存"),
         (f"/{plugin_name}/check-now", api.check_now, ["POST"], "立即检查一轮"),
+        (f"/{plugin_name}/clear-errors", api.clear_errors, ["POST"], "清空错误留存"),
         (f"/{plugin_name}/accounts", api.accounts, ["POST"], "增删监控博主"),
         (f"/{plugin_name}/sessions", api.sessions, ["POST"], "增删推送目标"),
         (f"/{plugin_name}/album-rules", api.album_rules, ["POST"], "增删相册规则"),
@@ -95,7 +104,7 @@ def register_dashboard(
             register(route, handler, methods, desc)
             ok = True
         except Exception as e:
-            logger.warning(f"{plugin_name} 注册面板接口 {route} 失败: {e!r}")
+            _plog(plugin_name).warning(f"注册面板接口 {route} 失败: {e!r}")
     return ok
 
 
@@ -115,6 +124,7 @@ class DashboardAPI:
         self.version = version
         self._extract_uid = extract_uid
         self._redact_proxy = redact_proxy
+        self._log = _plog(plugin_name)
 
     # ---------------- 工具 ----------------
 
@@ -166,6 +176,8 @@ class DashboardAPI:
                 "text": str(item.get("text") or "")[:120],
                 "created_ts": float(item.get("created_ts") or 0),
                 "retries": int(item.get("retries") or 0),
+                "video": bool(item.get("video_files")),
+                "sending": bool(item.get("last_send_ts")),
             }
             for item in p.pending[-PENDING_PAGE_LIMIT:]
         ]
@@ -199,6 +211,16 @@ class DashboardAPI:
                     "proxy": self._redact_proxy(p._proxy) if p._proxy else "",
                     "ffmpeg": bool(p._ffmpeg),
                     "album_enabled": bool(p.config.get("album_enabled", True)),
+                    # 在途后台任务：非零且有错误时配合错误日志定位卡在哪一步
+                    "bg_tasks": {
+                        "video_download": len(p._video_tasks),
+                        "video_preparing": len(p._video_preparing),
+                        "album_upload": len(p._album_tasks),
+                    },
+                    # 服务器水位：两次"无响应"事故都是内存顶穿，死机前最后一眼
+                    # 面板数据里应有内存余量；非 Linux 拿不到时为 null
+                    "mem": p._mem_snapshot(),
+                    "disk": p._disk_snapshot(),
                 },
                 "accounts": accounts,
                 "sessions": p._sessions(),
@@ -208,6 +230,20 @@ class DashboardAPI:
                 "activity": activity,
             }
         )
+
+    async def errors(self):
+        """错误留存快照（warning/error 全量留存，重启后仍有崩溃前的记录）。"""
+        store = getattr(self.p, "_errlog", None)
+        items = store.snapshot(ERRLOG_PAGE_LIMIT) if store is not None else []
+        return json_response({"errors": items})
+
+    async def clear_errors(self):
+        store = getattr(self.p, "_errlog", None)
+        if store is None:
+            return error_response("错误留存未启用（initialize 未完成或挂载失败）", 404)
+        cleared = await self.p.clear_error_log()
+        self._log.info(f"面板清空错误留存 {cleared} 条")
+        return json_response({"cleared": cleared})
 
     # ---------------- 操作 ----------------
 
@@ -232,7 +268,7 @@ class DashboardAPI:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(f"{self.name} 手动检查失败: {e!r}")
+                self._log.warning(f"手动检查失败: {e!r}")
                 p._record_event("error", detail=f"手动检查失败: {e}")
 
         p._manual_check_task = asyncio.create_task(_run())
@@ -256,7 +292,7 @@ class DashboardAPI:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.info(f"{self.name} 面板添加账号 {uid} 拉取昵称失败: {e!r}")
+                self._log.info(f"面板添加账号 {uid} 拉取昵称失败: {e!r}")
             p.accounts[uid] = {
                 "name": nickname or uid,
                 "seen_ids": [],

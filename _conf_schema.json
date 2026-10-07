@@ -42,7 +42,13 @@
     "description": "单个视频的下载/发送体积上限（MB），0 表示不限制",
     "type": "int",
     "default": 95,
-    "hint": "QQ 视频消息硬上限 100MB（超过协议端会拒绝发送），默认值刻意低于硬限留出余量；超限的视频不下载，直接降级为提示链接"
+    "hint": "QQ 视频消息硬上限 100MB（超过协议端会拒绝发送），默认值刻意低于硬限留出余量；超限的视频不下载，直接降级为提示链接。未配置 callback_api_base 时实际下载上限取本项与 video_inline_max_mb 中较小者"
+  },
+  "video_inline_max_mb": {
+    "description": "base64 内嵌发送的视频体积上限（MB），0 表示不限制",
+    "type": "int",
+    "default": 30,
+    "hint": "base64 内嵌一路上是文件体积 5~6 倍的瞬时内存（编码+序列化+传输，插件与协议端两侧各来一遍），大视频会把小内存服务器顶到无响应。超过此上限的视频自动降级为「请点原帖链接观看」提示；配置了 callback_api_base 的部署走本地路径注册回调、无内存放大，本项不生效。未配置 callback_api_base 时下载上限也会同步取本项与 video_max_mb 中较小者"
   },
   "video_quality": {
     "description": "视频清晰度偏好",
