@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import html as html_lib
@@ -25,6 +26,13 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image, Video
 from astrbot.api.star import Context, Star, StarTools
 
+try:
+    # 与 Video.to_dict() 读的是同一个全局配置对象，用它探测 callback_api_base
+    # 才能和 AstrBot 出站行为保持一致
+    from astrbot.core import astrbot_config
+except ImportError:  # 独立脚本 / 基准测试环境
+    astrbot_config = None
+
 from .napcat_album import (
     ALBUM_LIST_ITEM_ID_KEYS,
     ALBUM_LIST_ITEM_NAME_KEYS,
@@ -36,7 +44,7 @@ from .napcat_album import (
 from .dashboard import register_dashboard
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.6.0"
+PLUGIN_VERSION = "v1.6.1"
 
 WEIBO_HOME_URL = "https://m.weibo.cn/"
 WEIBO_INDEX_URL = "https://m.weibo.cn/api/container/getIndex"
@@ -1778,8 +1786,14 @@ class WeiboMonitorPlugin(Star):
         info["seen_ids"] = seen_list[-SEEN_IDS_LIMIT:]
         return len(new_posts), True
 
-    def _build_chain(self, item: dict[str, Any]) -> MessageChain:
-        """构建推送消息链：文本 + 可选图片段 + 可选视频段（message_with_* 开启时）。"""
+    async def _build_chain(
+        self, item: dict[str, Any], *, with_video: bool = True
+    ) -> MessageChain:
+        """构建推送消息链：文本 + 可选图片段 + 可选视频段（message_with_* 开启时）。
+
+        with_video=False 供视频发送反复失败后的降级重发使用：只发图文并附
+        说明，保证微博正文至少能到群里。
+        """
         chain = MessageChain().message(item["text"])
         if bool(self.config.get("message_with_images", True)):
             for pic in item.get("pics") or []:
@@ -1788,11 +1802,14 @@ class WeiboMonitorPlugin(Star):
                     # 轻量档：群里看够了，原图交给相册那条路
                     chain.chain.append(Image.fromURL(to_light(url)))
         if self._videos_enabled():
-            for path in item.get("video_files") or []:
-                p = Path(str(path))
-                if p.is_file():
-                    chain.chain.append(Video.fromFileSystem(path=str(p)))
             note = str(item.get("video_note") or "")
+            if with_video:
+                for path in item.get("video_files") or []:
+                    p = Path(str(path))
+                    if p.is_file():
+                        chain.chain.append(await self._video_segment(p))
+            elif item.get("video_files"):
+                note = note or VIDEO_FALLBACK_NOTE
             if note:
                 chain.message("\n" + note)
         return chain
@@ -1869,6 +1886,7 @@ class WeiboMonitorPlugin(Star):
                     f"重试 {item.get('retries', 0)} 轮仍失败，放弃推送",
                 )
                 logger.warning(f"推送重试超限，放弃微博 {item['post_id']}")
+                await self._last_chance_flush(item, sessions)
                 self._pending_discard(item)
                 changed = True
                 continue
@@ -1878,7 +1896,7 @@ class WeiboMonitorPlugin(Star):
                 self._ensure_video_prepare(item)
                 continue
             sent_sessions: list[str] = []
-            chain = self._build_chain(item)
+            chain = await self._build_chain(item)
             send_timeout = self._int_cfg("message_send_timeout", 60)
             if send_timeout and item.get("video_files"):
                 send_timeout = max(send_timeout, VIDEO_SEND_TIMEOUT_FLOOR)
@@ -1918,6 +1936,34 @@ class WeiboMonitorPlugin(Star):
             changed = True
         return changed
 
+    async def _last_chance_flush(
+        self, item: dict[str, Any], sessions: list[str]
+    ) -> None:
+        """重试超限放弃前的最后一搏：带视频的条目去掉视频段（正文+图+降级提示）
+        再各发一次。带毒的视频段（超 QQ 硬限、协议端不支持等）会把微博正文
+        一起拖死——整条消息在每一轮都失败，一条都出不去。
+        """
+        if not sessions or not self._videos_enabled() or not item.get("video_files"):
+            return
+        try:
+            chain = await self._build_chain(item, with_video=False)
+        except Exception as e:
+            logger.warning(f"微博 {item['post_id']} 降级消息构建失败: {e!r}")
+            return
+        for session in sessions:
+            try:
+                if await self._send_with_timeout(session, chain):
+                    logger.info(
+                        f"微博 {item['post_id']} 视频段多次发送失败，"
+                        f"已去视频降级重发到 {session}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"微博 {item['post_id']} 降级重发到 {session} 仍失败: {e!r}"
+                )
+
     # ---------------- 视频转发 ----------------
 
     def _videos_enabled(self) -> bool:
@@ -1930,6 +1976,39 @@ class WeiboMonitorPlugin(Star):
     def _wipe_video_tmp(self):
         """清掉上次运行残留的视频临时文件（正常流程发完即删，这里只兜底）。"""
         shutil.rmtree(self._video_tmp_root(), ignore_errors=True)
+
+    @staticmethod
+    def _callback_api_base() -> str:
+        if astrbot_config is None:
+            return ""
+        try:
+            return str(astrbot_config.get("callback_api_base") or "").strip()
+        except Exception:
+            return ""
+
+    async def _video_segment(self, p: Path) -> Video:
+        """构造视频段：默认 base64 内嵌，配置了 callback_api_base 才走本地路径。
+
+        aiocqhttp 出站时 Image/Record 会被 AstrBot 自动转成 base64 内嵌，Video
+        却把 file:// 路径原样透传——NapCat 与 AstrBot 分容器部署（互相看不到
+        对方文件系统，Docker 分容器是常态）时，协议端打开这个路径必然 ENOENT，
+        整条消息（含正文和图片）一起失败。base64 内嵌与图片同一条路，不依赖
+        任何路径映射或额外配置；代价是发送瞬间内存放大 ~1.33 倍，体积已被
+        video_max_mb 封顶。配了 callback_api_base 时 to_dict() 会把非 http 的
+        file 值交给 register_file 注册成回调下载地址，那条路只认本地文件，
+        base64 串会炸，所以保持 fromFileSystem 让 AstrBot 自己去注册。
+        """
+        if self._callback_api_base():
+            return Video.fromFileSystem(path=str(p))
+        try:
+            raw_b64 = await asyncio.to_thread(
+                lambda: base64.b64encode(p.read_bytes()).decode("ascii")
+            )
+        except OSError as e:
+            # 读不动（文件刚被清掉 / 权限问题）：退回路径模式，不比旧行为差
+            logger.warning(f"视频 {p.name} 读取失败，回退本地路径发送: {e!r}")
+            return Video.fromFileSystem(path=str(p))
+        return Video.fromBase64(raw_b64)
 
     def _video_ready(self, item: dict[str, Any]) -> bool:
         """条目的视频是否已就绪可发送：未开启 / 无视频 / 已下载 / 已降级 都算就绪。
