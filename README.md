@@ -131,7 +131,7 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 | `poll_interval` | `120` | 轮询间隔（秒），最小 30；越小越实时，也越易触发风控 |
 | `include_retweets` | `true` | 是否推送博主转发的微博 |
 | `message_format` | 见配置面板 | 消息模板，占位符 `{name}` `{time}` `{weibo}` `{link}`，`\n` 换行 |
-| `message_with_images` | `true` | 推送消息附带微博图片（`mw2000` 轻量档，跟随张数上限截断） |
+| `message_with_images` | `true` | 推送消息附带微博图片（`mw2000` 轻量档，跟随张数上限截断）；被 QQ 按像素尺寸拒收时自动去图重发正文 |
 | `message_with_videos` | `true` | 推送消息附带微博视频（QQ 视频消息，可直接播放），详见[视频转发](#视频转发) |
 | `video_max_mb` | `95` | 单个视频的下载/发送体积上限（MB，0 不限制），QQ 硬限 100MB，超限自动降级为链接提示；未配 `callback_api_base` 时实际下载上限取本项与 `video_inline_max_mb` 中较小者 |
 | `video_inline_max_mb` | `30` | base64 内嵌发送的视频体积上限（MB，0 不限制），超限降级为链接提示，防大视频内存尖峰顶死小服务器；配置 `callback_api_base` 后走路径直传、本项不生效 |
@@ -257,6 +257,7 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 - 推送到多个群时，任一群成功即视为推送成功，不做按群粒度的重试。
 - 置顶微博不推送（避免置顶内容反复提醒）；置顶解除后会正常检测。
 - 群相册上传仅支持 NapCat 协议端（≥ v4.8.101）；纯视频微博不上传图片；相册上传失败不做自动重传，缺失图片可手动补传。
+- 消息里的图片由协议端远程抓取，QQNT 对像素尺寸超限的图（超长截图、超大原图等）会**连带拒收整条消息**，NapCat 回 `rich media transfer failed`（retcode 1200）。插件命中该报错后立即去掉图片段补发正文并在消息尾部附说明，该条微博此后不再带图（原样重发多少轮都是同一个结果，只会白烧 `max_pending_retries` 轮直到放弃）；群相册的原图上传不受影响，图片照样进群相册。
 - 视频转发依赖协议端对 OneBot v11 `video` 消息段的支持（NapCat / Lagrange 群聊均可）；QQ 视频消息硬上限 100MB；直播中的视频与直播回放不支持。NapCat 部分版本存在发视频报 `rich media transfer failed (result: -1)` 的回归，遇到时请升级 NapCat。分离部署开箱即用（视频以 base64 内嵌发送，无需路径映射配置）；配置 `callback_api_base` 可改走路径直传以省内存，见[视频转发](#视频转发)。
 
 ## 目录结构

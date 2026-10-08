@@ -53,7 +53,7 @@ from .napcat_album import (
 from .dashboard import register_dashboard
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.6.4"
+PLUGIN_VERSION = "v1.7.1"
 
 
 def _plugin_log_target() -> "logging.Logger":
@@ -187,6 +187,11 @@ VIDEO_DL_TIMEOUT = 300.0  # 单个视频下载总超时（秒）：几十上百 
 VIDEO_SEND_TIMEOUT_FLOOR = 180
 VIDEO_FALLBACK_NOTE = "🎬 视频未能自动转发，请点原帖链接观看"
 VIDEO_PARTIAL_NOTE = "🎬 部分视频未能自动转发，请点原帖链接观看"
+PIC_REJECTED_NOTE = "🖼 图片超出 QQ 收发限制未能发出，原图请看原帖链接"
+# QQNT 对像素尺寸超限的富媒体直接拒收整条消息（NapCatQQ#1443），回的是
+# retcode 1200 + 这句 errMsg。按文本判而不是按码判：1200 是 WS 通道的通用失败码，
+# 参数错、下载失败也走它，只有文案能区分"这条重试一万次也不会成"
+PIC_REJECTED_MARKER = "rich media transfer failed"
 
 # ---------------- WebUI 控制面板（dashboard.py 提供页面与 API） ----------------
 ACTIVITY_MAX = 200  # 最近动态最多保留条数（随 state.json 持久化）
@@ -2122,15 +2127,20 @@ class WeiboMonitorPlugin(Star):
         """构建推送消息链：文本 + 可选图片段 + 可选视频段（message_with_* 开启时）。
 
         with_video=False 供视频发送反复失败后的降级重发使用：只发图文并附
-        说明，保证微博正文至少能到群里。
+        说明，保证微博正文至少能到群里。条目上挂着 pic_rejected（图片段已被
+        协议端拒收过）时不带图片段，改附提示。
         """
         chain = MessageChain().message(item["text"])
         if bool(self.config.get("message_with_images", True)):
-            for pic in item.get("pics") or []:
-                url = str(pic.get("url") or "")
-                if url:
-                    # 轻量档：群里看够了，原图交给相册那条路
-                    chain.chain.append(Image.fromURL(to_light(url)))
+            if item.get("pic_rejected"):
+                # 图片段已被协议端拒收过：这条起不再带图，否则会原样再撞一次
+                chain.message("\n" + PIC_REJECTED_NOTE)
+            else:
+                for pic in item.get("pics") or []:
+                    url = str(pic.get("url") or "")
+                    if url:
+                        # 轻量档：群里看够了，原图交给相册那条路
+                        chain.chain.append(Image.fromURL(to_light(url)))
         if self._videos_enabled():
             note = str(item.get("video_note") or "")
             if with_video:
@@ -2181,6 +2191,23 @@ class WeiboMonitorPlugin(Star):
             raise
         except asyncio.TimeoutError as e:
             raise TimeoutError(f"发送超过 {send_timeout} 秒，平台是否已接收未知") from e
+
+    @staticmethod
+    def _is_pic_rejected(exc: BaseException) -> bool:
+        """异常是否为"富媒体被协议端拒收"（QQNT 尺寸风控，NapCatQQ#1443）。
+
+        这一类是协议端明确回了失败：消息确定没送达，且原样重发多少次都是同样
+        的结果，只有把图片段摘掉才发得出去。
+        """
+        return PIC_REJECTED_MARKER in str(exc).lower()
+
+    def _pics_enabled(self, item: dict[str, Any]) -> bool:
+        """这条链当前会不会带图片段：开关开着、有图、且图片段还没被拒收过。"""
+        return bool(
+            item.get("pics")
+            and not item.get("pic_rejected")
+            and bool(self.config.get("message_with_images", True))
+        )
 
     def _pending_discard(self, item: dict[str, Any]):
         """按对象身份从待推送队列移除一条（内容相同的两条互不误伤）。
@@ -2296,7 +2323,36 @@ class WeiboMonitorPlugin(Star):
                         f"微博 {item['post_id']} 对该会话不再重发（防重复）"
                     )
                 except Exception as e:
-                    logger.warning(f"推送到 {session} 失败: {e!r}")
+                    if not self._is_pic_rejected(e) or not self._pics_enabled(item):
+                        logger.warning(f"推送到 {session} 失败: {e!r}")
+                        continue
+                    # 图片段被协议端按像素尺寸拒收（NapCatQQ#1443）会连带整条消息
+                    # 一起失败：原样重发多少轮都是同一个结果，最后正文一条都进不了
+                    # 群。摘掉图片段立刻补发——协议端明确回了失败，确定没送达，补发
+                    # 不会造成重复。标记留在条目上，本轮其余会话与后续轮次都不再带图
+                    item["pic_rejected"] = True
+                    logger.warning(
+                        f"推送到 {session} 失败：图片段被协议端拒收，"
+                        f"已去掉图片重发微博 {item['post_id']} 的正文"
+                    )
+                    chain = await self._build_chain(item)
+                    try:
+                        await self._send_with_timeout(
+                            session, chain, timeout_seconds=send_timeout
+                        )
+                        sent_sessions.append(session)
+                    except asyncio.CancelledError:
+                        raise
+                    except TimeoutError:
+                        timed_out_sessions.append(session)
+                        logger.warning(
+                            f"推送到 {session} 去图重发超过 {send_timeout} 秒未返回，"
+                            f"结果未知：微博 {item['post_id']} 对该会话不再重发（防重复）"
+                        )
+                    except Exception as retry_err:
+                        logger.warning(
+                            f"推送到 {session} 去图重发仍失败: {retry_err!r}"
+                        )
             if sent_sessions:
                 self._pending_discard(item)
                 logger.info(f"已推送微博 {item['post_id']}")
@@ -2308,6 +2364,13 @@ class WeiboMonitorPlugin(Star):
                     + (
                         f"，另 {len(timed_out_sessions)} 个会话超时结果未知未重发"
                         if timed_out_sessions
+                        else ""
+                    )
+                    # 标记可能来自本轮的补发，也可能来自更早的轮次（去图后
+                    # 下一轮才发出去），记账口径一致
+                    + (
+                        "，图片段被协议端拒收，已去图改发正文"
+                        if item.get("pic_rejected")
                         else ""
                     ),
                 )
