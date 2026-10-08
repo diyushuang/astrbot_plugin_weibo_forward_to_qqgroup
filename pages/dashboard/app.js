@@ -10,6 +10,7 @@ const KIND_LABEL = {
   push_fail: "推送放弃",
   album: "相册上传",
   album_fail: "相册失败",
+  video_fail: "视频未转发",
   risk: "风控冷却",
   error: "检查异常",
   info: "事件",
@@ -415,8 +416,11 @@ function renderPending(pending, totalCount) {
     tr.append(el("td", "", item.name || item.uid || "—"));
     const textCell = el("td");
     if (item.video) textCell.append(el("span", "badge", "含视频"));
+    else if (item.video_fail) textCell.append(el("span", "badge warn", "视频未转发"));
     if (item.text) textCell.append(el("span", "dim", item.text));
     else if (!item.video) textCell.append(el("span", "dim", "（无内容）"));
+    if (item.video_fail && !item.video)
+      textCell.append(el("div", "dim", "失败原因：" + item.video_fail));
     tr.append(textCell);
     tr.append(el("td", "dim", item.created_ts ? fmtTime(item.created_ts) : "—"));
     const retry = el("td");

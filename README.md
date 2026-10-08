@@ -2,6 +2,7 @@
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A5%204.9.2-blue)](https://github.com/AstrBotDevs/AstrBot)
 [![版本](https://img.shields.io/github/v/tag/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup)](https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/releases)
+[![许可证](https://img.shields.io/github/license/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup)](LICENSE)
 [![协议端](https://img.shields.io/badge/适配器-aiocqhttp%20%2F%20NapCat-brightgreen)](#环境要求)
 [![免 Cookie](https://img.shields.io/badge/%E5%BE%AE%E5%8D%9A%20Cookie-%E6%97%A0%E9%9C%80%E7%99%BB%E5%BD%95-success)](#工作原理)
 
@@ -143,7 +144,7 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 | `filter_keywords` | `[]` | 屏蔽词：正文命中任一则不推送 |
 | `whitelist_keywords` | `[]` | 白名单：非空时正文须命中任一关键词才推送 |
 | `push_delay_seconds` | `2` | 多条推送之间的间隔（秒），防刷屏与 QQ 风控 |
-| `max_pending_retries` | `20` | 推送失败最大重试轮数，超过后放弃 |
+| `max_pending_retries` | `5` | 推送失败最大重试轮数，超过后放弃（只兜瞬时故障：协议端的确定性拒收当场摘段补发，不烧配额） |
 | `message_send_timeout` | `60` | 单条消息发送超时（秒），0 不限制 |
 | `album_enabled` | `true` | 图片自动上传群相册总开关（无绑定规则时不会有任何行为） |
 | `album_rules` | `[]` | 相册绑定规则，每条 `uid:群号:相册名或ID`（推荐用指令管理） |
@@ -193,15 +194,17 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 
 ## 视频转发
 
-开启 `message_with_videos` 后，检测到视频的微博会额外请求一次微博详情接口提取视频直链，下载到本地临时目录后以 **QQ 视频消息**发送（群里点开即可播放），发完即删临时文件。
+开启 `message_with_videos` 后，检测到视频的微博会提取视频直链，下载到本地临时目录后以 **QQ 视频消息**发送（群里点开即可播放），发完即删临时文件。直链优先取时间线卡片自带的 `page_info.media_info`（实测 m.weibo.cn 已经把可用 mp4 档给到了卡片里，12/12 样本与详情接口一致），卡片里取不到才补一次 `statuses/show` 详情请求——密集发博的账号每轮可省下若干个 2~5 秒限速的微博请求，也少一个可能被风控的失败点。
 
 **覆盖范围**：纯视频帖、图文混排帖（mix_media_info 里的视频与图片都会带上）、转发原微博带视频的帖子。直播中的视频暂不支持（自动降级为链接提示）。
 
-**清晰度与体积**：优先取微博多码率数组中的 mp4 档（`video_quality` 选档，失败自动尝试其它档位与旧版字段回退链；base64 内嵌发送时会优先挑体积适配上限的最高清晰度档位，1080p 超帽自动落 720p/流畅档）。QQ 视频消息硬上限 100MB，`video_max_mb` 默认 95MB 留出余量；超限的视频不做无谓下载，直接在消息尾部附「🎬 视频请点原帖链接观看」。
+**清晰度与体积**：优先取微博多码率数组中的 mp4 档（`video_quality` 选档，失败自动尝试其它档位与旧版字段回退链，含 `media_info.urls` 里的 `mp4_hd_mp4` / `mp4_720p_mp4` / `mp4_ld_mp4` 档位表；base64 内嵌发送时会优先挑体积适配上限的最高清晰度档位，1080p 超帽自动落 720p/流畅档）。QQ 视频消息硬上限 100MB，`video_max_mb` 默认 95MB 留出余量；超限的视频**连一个字节正文都不下载**（按响应头声明的体积当场判超限，换下一档或直接降级），失败原因（超上限 / HTTP 状态 / 磁盘余量…）记在面板的「视频未转发」条目上，不再只留一句「未能自动转发」。
 
 **内嵌体积上限（`video_inline_max_mb`，默认 30MB）**：base64 内嵌一路上是文件体积 5~6 倍的瞬时内存（编码串 + JSON 序列化 + 传输缓冲，插件与协议端两侧各来一遍），大视频会把小内存服务器顶到无响应——这也是「服务器卡死 → 发送超时重发 → 群里重复收到同一消息 → 相册上传成批失败」这条事故链的根因。超过上限的视频自动降级为链接提示；未配置 `callback_api_base` 时下载上限也会同步取 `video_max_mb` 与本项中较小者。大视频刚需的部署请配置 `callback_api_base` 走路径直传（无内存放大，本项不生效）。
 
-**为什么必须先下载**：微博视频 CDN 校验 Referer 防盗链且直链带签名会过期，不能像图片那样把链接丢给协议端自己抓。插件下载时已带正确的 Referer 与 UA。
+**为什么必须先下载**：微博视频 CDN 校验 Referer 防盗链（实测无 Referer 直接 403）且直链带签名会过期，不能像图片那样把链接丢给协议端自己抓。插件下载时已带正确的 Referer 与 UA。
+
+**签名过期与自愈**：直链的签名有效窗实测约 **3600 秒**。跨轮次重试、插件重载（WebUI 保存配置即触发，会清空 `video_tmp`）后，条目里挂着的都是旧链，拿去下载必然 403——所以下载前会先检查直链年龄，过窗就重新提取一次；下载中途撞到 403/404 也当场重取新链重试同一档。一轮失败不再把这条视频永久判死：最多试 `3` 轮（轮与轮之间隔一个轮询间隔，每轮都带新链），耗尽才落「🎬 视频未能自动转发」提示。超上限这类确定性失败会**当场定论**，不空等后续轮次。
 
 **部署形态**：
 
@@ -215,7 +218,7 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 
 无需记忆指令：**AstrBot 管理面板 → 插件 → 微博实时转发 → 详情页 → 打开页面**（插件页面由 Dashboard 内嵌加载，无需额外端口与认证配置）。
 
-**展示**：轮询任务与下次检查时间、待推送队列（含重试、「含视频」「发送中」标记）、风控冷却剩余、身份模式与年龄、出网方式（凭据打码）、**服务器内存与磁盘余量**（内存低于 512MB 红色告警——历史「服务器无响应」事故均为内存顶穿，死机前最后一眼面板就有余量）、后台任务在途数（视频下载 / 相册上传）、监控博主（昵称 / 已见数 / 失败退避 / 推送数）、推送目标与相册规则、推送统计（近 7 天柱状图 / 博主排行）、最近动态时间线、**错误日志留存**。
+**展示**：轮询任务与下次检查时间、待推送队列（含重试、「含视频」「发送中」「视频未转发」标记，视频没转发时会直接显示**失败原因**）、风控冷却剩余、身份模式与年龄、出网方式（凭据打码）、**服务器内存与磁盘余量**（内存低于 512MB 红色告警——历史「服务器无响应」事故均为内存顶穿，死机前最后一眼面板就有余量）、后台任务在途数（视频下载 / 相册上传）、监控博主（昵称 / 已见数 / 失败退避 / 推送数）、推送目标与相册规则、推送统计（近 7 天柱状图 / 博主排行）、最近动态时间线（含「视频未转发」条目）、**错误日志留存**。
 
 **错误日志留存**：本插件所有 warning/error（发送超时、检查失败、相册上传失败、风控冷却、后台任务异常）在产生的瞬间写入 `data/astrbot_plugin_weibo_forward_to_qqgroup/errors.log`（JSONL 逐条 fsync，512KB 自动轮转）并在面板「错误日志留存」卡片展示，服务器崩溃 / 无响应后重启仍能看到出事前的最后记录（带「上次运行」标记）；支持一键清空。
 
@@ -257,7 +260,8 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 - 推送到多个群时，任一群成功即视为推送成功，不做按群粒度的重试。
 - 置顶微博不推送（避免置顶内容反复提醒）；置顶解除后会正常检测。
 - 群相册上传仅支持 NapCat 协议端（≥ v4.8.101）；纯视频微博不上传图片；相册上传失败不做自动重传，缺失图片可手动补传。
-- 消息里的图片由协议端远程抓取，QQNT 对像素尺寸超限的图（超长截图、超大原图等）会**连带拒收整条消息**，NapCat 回 `rich media transfer failed`（retcode 1200）。插件命中该报错后立即去掉图片段补发正文并在消息尾部附说明，该条微博此后不再带图（原样重发多少轮都是同一个结果，只会白烧 `max_pending_retries` 轮直到放弃）；群相册的原图上传不受影响，图片照样进群相册。
+- 消息里的图片由协议端远程抓取，QQNT 对像素尺寸/体积超限的富媒体（超长截图、超大原图、超限视频）会**连带拒收整条消息**，NapCat 回 `rich media transfer failed`（retcode 1200）。这类报错原样重发多少轮都是同一个结果，所以插件命中后当场按嫌疑顺序摘段补发：先去掉图片段只发正文（尾部附说明），摘了图仍被拒说明凶手是视频段——去掉视频段并把图片段放回来再发（图片此时还没被证明有罪），两段都撞过才彻底只发正文。摘段结论记在该条待推送项上，本轮其余会话与后续轮次都不再带那一段，也不占用 `max_pending_retries`；群相册的原图上传走另一套接口，不受影响，图片照样进群相册。
+- `max_pending_retries`（默认 5 轮）只用来兜住网络抖动、协议端重启这类瞬时故障。超限后停止整条重发：条目还带着视频段时先去掉视频段补发一次，并按**真实结果**记账——降级消息真发出去了记推送成功（面板与群里一致，群相册照常上传），一条都没出去才记「放弃推送」。
 - 视频转发依赖协议端对 OneBot v11 `video` 消息段的支持（NapCat / Lagrange 群聊均可）；QQ 视频消息硬上限 100MB；直播中的视频与直播回放不支持。NapCat 部分版本存在发视频报 `rich media transfer failed (result: -1)` 的回归，遇到时请升级 NapCat。分离部署开箱即用（视频以 base64 内嵌发送，无需路径映射配置）；配置 `callback_api_base` 可改走路径直传以省内存，见[视频转发](#视频转发)。
 
 ## 目录结构
@@ -265,14 +269,35 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 ```
 astrbot_plugin_weibo_forward_to_qqgroup/  ← 仓库根即插件目录
 ├── main.py            # 插件主逻辑（轮询 / 游客身份 / 推送）
+├── constants.py       # 面板与主逻辑共享的分页/缓冲常量（避免两处定义漂移）
 ├── napcat_album.py    # NapCat 群相册 OneBot 扩展客户端（上传 / 相册列表 / 去重）
 ├── dashboard.py       # WebUI 控制面板后端 API
 ├── pages/dashboard/   # WebUI 控制面板前端页面
 ├── metadata.yaml      # 插件元信息
 ├── _conf_schema.json  # WebUI 配置面板定义
 ├── requirements.txt   # 依赖声明（仅 aiohttp）
+├── ruff.toml          # 代码风格与静态检查配置
+├── LICENSE
 ├── CHANGELOG.md
 └── README.md
+```
+
+## 开发
+
+代码风格由仓库根目录的 `ruff.toml` 统一约定（行宽 100、目标 Python 3.10、启用 E/F/W/I/UP/B/SIM/RUF 规则集）。提交前建议跑一遍：
+
+```bash
+ruff check .          # 静态检查
+ruff format --check . # 格式校验（自动修复去掉 --check）
+```
+
+`bench/` 下是离线回归脚本（stub 掉 AstrBot 依赖即可运行），改动推送链路后请至少跑通与改动相关的用例：
+
+```bash
+python bench/_test_video_chain.py      # 视频候选/过窗/判死
+python bench/_test_pic_reject.py       # 图片拒收与摘段补发
+python bench/_test_v163_errorlog.py    # 错误留存与轮转
+python bench/test_dashboard_api.py     # 面板 API
 ```
 
 ## 贡献
@@ -281,6 +306,10 @@ astrbot_plugin_weibo_forward_to_qqgroup/  ← 仓库根即插件目录
 
 ## 许可证
 
-尚未指定开源许可证（仓库暂无 LICENSE 文件，待补充）。
+本项目采用 [MIT License](LICENSE) 开源。
+
+- **版权所有**：Copyright (c) 2026 diyushuang
+- **核心条款**：任何人可免费获取本软件及副本，不受限制地使用、复制、修改、合并、发布、分发、再许可和/或销售；唯一义务是在软件的所有副本或实质性部分中保留上述版权声明与本许可声明。软件按"原样"提供，不附带任何形式的明示或默示担保（包括但不限于适销性、特定用途适用性和非侵权担保），作者或版权持有人不对因本软件或本软件的使用而产生的任何索赔、损害或其他责任负责。
+- **兼容性说明**：MIT 是宽松许可证，允许闭源再分发与商业使用，与本项目"供 AstrBot 用户自行部署"的定位相符。v1.2.0 曾参考同类项目 [jiantoucn/astrbot_plugin_weibo_monitor](https://github.com/jiantoucn/astrbot_plugin_weibo_monitor) 的功能设计，但本项目为该项目的**独立重写**：不包含其源代码，两仓库之间无代码复制，且上游仓库未声明任何许可证。此处一并致谢其思路启发。
 
 <!-- Badges 链接、安装与升级说明中的仓库地址，如仓库迁移请同步修改。 -->

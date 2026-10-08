@@ -4,11 +4,16 @@
 地址、token 这些都是 AstrBot 适配器该管的事，插件不另配一份。
 
 接口契约以 NapCatQQ 源码为准（packages/napcat-onebot/action/router.ts、extends/*）：
-- get_qun_album_list          {group_id:str, attach_info?:str} -> {album_list, attach_info, has_more}
-- upload_image_to_qun_album   {group_id:str, album_id:str, album_name:str, file:str} -> 无 data
-- get_group_album_media_list  {group_id:str, album_id:str, attach_info:str} -> {media_list, has_more}
 
-接口名里 qun/group 混用是上游现状，不是笔误；四个参数全是 String，传数字会被 schema 拒掉。
+- get_qun_album_list
+  {group_id:str, attach_info?:str} -> {album_list, attach_info, has_more}
+- upload_image_to_qun_album
+  {group_id:str, album_id:str, album_name:str, file:str} -> 无 data
+- get_group_album_media_list
+  {group_id:str, album_id:str, attach_info:str} -> {media_list, has_more}
+
+接口名里 qun/group 混用是上游现状，不是笔误；四个参数全是 String，传数字会被
+schema 拒掉。
 """
 
 import asyncio
@@ -74,7 +79,8 @@ _HINT_RULES = (
     (("album", "相册"), "相册可能已被删除或 ID 有误，用 微博列相册 重新确认"),
 )
 # 值得退避重试的瞬时故障：QQ 相册网关抖动 + 连接层面的问题 + 频控。
-_RETRYABLE_HINTS = _UPSTREAM_HINTS + (
+_RETRYABLE_HINTS = (
+    *_UPSTREAM_HINTS,
     "socket hang up",
     "connection reset",
     "connection refused",
@@ -309,9 +315,7 @@ class NapCatAlbum:
         out: list[dict] = []
         attach = ""
         for _ in range(20):
-            d = await self.call(
-                "get_qun_album_list", group_id=str(group_id), attach_info=attach
-            )
+            d = await self.call("get_qun_album_list", group_id=str(group_id), attach_info=attach)
             raw = d.get("album_list") or d.get("list") or []
             for it in raw:
                 if isinstance(it, dict):
@@ -325,9 +329,7 @@ class NapCatAlbum:
             attach = nxt
         return out
 
-    async def list_media(
-        self, group_id: str, album_id: str, max_pages: int = 8
-    ) -> list[dict]:
+    async def list_media(self, group_id: str, album_id: str, max_pages: int = 8) -> list[dict]:
         """相册里已有的媒体（该接口没有 count 参数，只能靠 attach_info 翻页）。"""
         items: list[dict] = []
         attach = ""
@@ -391,36 +393,21 @@ class NapCatAlbum:
         for a in albums:
             if pick(a, ALBUM_LIST_ITEM_ID_KEYS) == want:
                 return want, pick(a, ALBUM_LIST_ITEM_NAME_KEYS, want)
-        exact = [
-            a
-            for a in albums
-            if _norm(pick(a, ALBUM_LIST_ITEM_NAME_KEYS)) == _norm(want)
-        ]
-        loose = [
-            a
-            for a in albums
-            if _norm(want) in _norm(pick(a, ALBUM_LIST_ITEM_NAME_KEYS))
-        ]
+        exact = [a for a in albums if _norm(pick(a, ALBUM_LIST_ITEM_NAME_KEYS)) == _norm(want)]
+        loose = [a for a in albums if _norm(want) in _norm(pick(a, ALBUM_LIST_ITEM_NAME_KEYS))]
         hit = (exact or loose or [None])[0]
         if not hit:
-            names = (
-                "、".join(pick(a, ALBUM_LIST_ITEM_NAME_KEYS, "?") for a in albums)
-                or "（无）"
-            )
+            names = "、".join(pick(a, ALBUM_LIST_ITEM_NAME_KEYS, "?") for a in albums) or "（无）"
             raise NapCatError(
                 f"群里没有找到相册「{want}」，现有相册：{names}。请先在 QQ 里手动创建相册"
             )
         aid = pick(hit, ALBUM_LIST_ITEM_ID_KEYS)
         name = pick(hit, ALBUM_LIST_ITEM_NAME_KEYS, want)
         if not aid:
-            raise NapCatError(
-                f"相册「{name}」缺少 album_id，请改用 微博列相册 里的相册 ID"
-            )
+            raise NapCatError(f"相册「{name}」缺少 album_id，请改用 微博列相册 里的相册 ID")
         return aid, name
 
-    async def upload_file(
-        self, group_id: str, album_id: str, album_name: str, path: Path
-    ) -> str:
+    async def upload_file(self, group_id: str, album_id: str, album_name: str, path: Path) -> str:
         """按 self.modes 的顺序试载荷，返回命中的方式。
 
         默认只有 base64 一种：NapCat 收到它会先落一个 randomUUID 命名的临时文件再传，

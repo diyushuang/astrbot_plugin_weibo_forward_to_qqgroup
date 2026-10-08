@@ -421,7 +421,7 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .act-line { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .act-kind { font-weight: 600; }
 .act-kind.push { color: var(--ok); }
-.act-kind.push_fail, .act-kind.error, .act-kind.album_fail { color: var(--err); }
+.act-kind.push_fail, .act-kind.error, .act-kind.album_fail, .act-kind.video_fail { color: var(--err); }
 .act-kind.risk { color: var(--warn); }
 .act-kind.album { color: var(--accent); }
 .act-name { font-weight: 600; }

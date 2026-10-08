@@ -14,9 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from astrbot.api import logger
+
+# 面板单次返回的明细条数上限（队列、动态、错误留存）。与 main.py 共用同一份
+# 取值，见 constants.py——以前两处各写一份、靠注释提醒同步，容易改漏。
+from .constants import (
+    ACTIVITY_PAGE_LIMIT,
+    ERRLOG_PAGE_LIMIT,
+    PENDING_PAGE_LIMIT,
+)
 
 try:  # 新版 AstrBot：astrbot.api.web 提供请求代理与响应助手
     from astrbot.api.web import error_response, json_response
@@ -27,7 +36,7 @@ except ImportError:  # 旧版 Dashboard 走 Quart 原生上下文，做最小等
     try:
         from quart import jsonify
 
-        class web_request:  # noqa: N801 - 与新版的 request 代理同名，保持调用点一致
+        class web_request:
             """最小请求代理：面板只需要读 JSON body。"""
 
             @staticmethod
@@ -58,18 +67,10 @@ except ImportError:  # 旧版 Dashboard 走 Quart 原生上下文，做最小等
         def error_response(message: str, status_code: int = 400):
             raise RuntimeError("AstrBot WebUI 不可用（缺少 quart），控制面板未启用")
 
-        class web_request:  # noqa: N801
+        class web_request:
             @staticmethod
             async def json(default: Any = None) -> Any:
                 return {} if default is None else default
-
-
-# 面板单次返回的明细条数上限（队列与动态），全量数据在 state.json 里
-PENDING_PAGE_LIMIT = 50
-ACTIVITY_PAGE_LIMIT = 50
-# 错误留存单次返回条数（与 main.py 的 ERRLOG_PAGE_LIMIT 口径一致；不反向
-# import main，这里各自定义，改了要同步）
-ERRLOG_PAGE_LIMIT = 50
 
 
 def register_dashboard(
@@ -190,6 +191,9 @@ class DashboardAPI:
                 "created_ts": float(item.get("created_ts") or 0),
                 "retries": int(item.get("retries") or 0),
                 "video": bool(item.get("video_files")),
+                # 视频没下来时面板要能说出为什么（旧状态文件没有该字段）
+                "video_fail": str(item.get("video_fail") or "")[:160],
+                "video_note": bool(item.get("video_note")),
                 "sending": bool(item.get("last_send_ts")),
             }
             for item in p.pending[-PENDING_PAGE_LIMIT:]
@@ -205,9 +209,7 @@ class DashboardAPI:
                     "checking": bool(p._checking),
                     "last_check_ts": float(p.last_check_ts or 0),
                     "next_check_ts": (
-                        float(p.last_check_ts or 0) + poll_interval
-                        if p.last_check_ts
-                        else 0.0
+                        float(p.last_check_ts or 0) + poll_interval if p.last_check_ts else 0.0
                     ),
                     "poll_interval": poll_interval,
                     "pending_count": len(p.pending),
@@ -276,9 +278,7 @@ class DashboardAPI:
         async def _run():
             try:
                 new_count = await p.check_all()
-                p._record_event(
-                    "info", detail=f"手动检查完成，检测到 {new_count} 条新微博"
-                )
+                p._record_event("info", detail=f"手动检查完成，检测到 {new_count} 条新微博")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -315,7 +315,7 @@ class DashboardAPI:
                 "next_retry_ts": 0.0,
             }
             p.config["monitored_uids"] = list(p.accounts.keys())
-            p.config.save_config()
+            p._save_config()
             p._save_state()
             name = p._account_name(uid)
             p._record_event("info", uid=uid, name=name, detail="通过面板添加监控")
@@ -327,7 +327,7 @@ class DashboardAPI:
                 return error_response(f"账号 {uid} 不在监控列表中")
             name = str(p.accounts.pop(uid).get("name") or uid)
             p.config["monitored_uids"] = list(p.accounts.keys())
-            p.config.save_config()
+            p._save_config()
             p._save_state()
             p._record_event("info", uid=uid, name=name, detail="通过面板取消监控")
             return json_response({"removed": uid, "name": name})
@@ -342,15 +342,14 @@ class DashboardAPI:
             parts = umo.split(":")
             if len(parts) != 3 or not all(parts):
                 return error_response(
-                    "会话 ID 格式应为 平台:消息类型:会话号，"
-                    "例如 aiocqhttp:GroupMessage:123456"
+                    "会话 ID 格式应为 平台:消息类型:会话号，例如 aiocqhttp:GroupMessage:123456"
                 )
             sessions = p._sessions()
             if umo in sessions:
                 return error_response("该会话已在推送列表中")
             sessions.append(umo)
             p.config["push_sessions"] = sessions
-            p.config.save_config()
+            p._save_config()
             p._record_event("info", detail=f"通过面板新增推送目标 {umo}")
             return json_response({"added": umo})
         if action == "remove":
@@ -359,7 +358,7 @@ class DashboardAPI:
                 return error_response("该会话不在推送列表中")
             sessions.remove(umo)
             p.config["push_sessions"] = sessions
-            p.config.save_config()
+            p._save_config()
             p._record_event("info", detail=f"通过面板移除推送目标 {umo}")
             return json_response({"removed": umo})
         return error_response("不支持的操作")
@@ -382,7 +381,7 @@ class DashboardAPI:
             rules = p._album_rules()
             rules[(uid, gid)] = album
             p.config["album_rules"] = [f"{u}:{g}:{a}" for (u, g), a in rules.items()]
-            p.config.save_config()
+            p._save_config()
             p._record_event(
                 "info",
                 uid=uid,
@@ -398,7 +397,7 @@ class DashboardAPI:
                 return error_response("该规则不存在（可能已被移除）")
             rules.pop((uid, gid))
             p.config["album_rules"] = [f"{u}:{g}:{a}" for (u, g), a in rules.items()]
-            p.config.save_config()
+            p._save_config()
             p._record_event("info", uid=uid, detail=f"面板移除相册绑定：群 {gid}")
             return json_response({"removed": f"{uid}:{gid}"})
         return error_response("不支持的操作")
@@ -440,7 +439,7 @@ class DashboardAPI:
             p.config["album_keyword_rules"] = [
                 f"{u}:{k}:{g}:{a}" if u else f"{k}:{g}:{a}" for u, k, g, a in rules
             ]
-            p.config.save_config()
+            p._save_config()
             scope = f"博主 {uid}" if uid else "全局"
             p._record_event(
                 "info",
@@ -448,27 +447,19 @@ class DashboardAPI:
                 name=p._account_name(uid) if uid else "",
                 detail=f"面板设置关键词路由（{scope}）：「{keyword}」→ 群 {gid} 相册「{album}」",
             )
-            return json_response(
-                {"uid": uid or "", "keyword": keyword, "gid": gid, "album": album}
-            )
+            return json_response({"uid": uid or "", "keyword": keyword, "gid": gid, "album": album})
         if action == "remove":
             uid = str(body.get("uid") or "").strip() or None
             keyword = str(body.get("keyword") or "").strip()
             gid = str(body.get("gid") or "").strip()
             rules = p._album_keyword_rules()
-            if not any(
-                u == uid and k == keyword and g == gid for u, k, g, _ in rules
-            ):
+            if not any(u == uid and k == keyword and g == gid for u, k, g, _ in rules):
                 return error_response("该规则不存在（可能已被移除）")
-            rules = [
-                r
-                for r in rules
-                if not (r[0] == uid and r[1] == keyword and r[2] == gid)
-            ]
+            rules = [r for r in rules if not (r[0] == uid and r[1] == keyword and r[2] == gid)]
             p.config["album_keyword_rules"] = [
                 f"{u}:{k}:{g}:{a}" if u else f"{k}:{g}:{a}" for u, k, g, a in rules
             ]
-            p.config.save_config()
+            p._save_config()
             scope = f"博主 {uid}" if uid else "全局"
             p._record_event(
                 "info",

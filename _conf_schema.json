@@ -163,7 +163,8 @@
   "max_pending_retries": {
     "description": "单条推送失败后的最大重试轮数，超过后放弃",
     "type": "int",
-    "default": 20
+    "default": 5,
+    "hint": "只用于兜住网络抖动/协议端重启这类瞬时故障。协议端的确定性拒收（rich media transfer failed）不会烧重试配额：命中后当场摘掉图片段/视频段补发"
   },
   "message_send_timeout": {
     "description": "单条消息发送超时（秒），0 表示不限制",
@@ -182,6 +183,7 @@
     "description": "可选：HTTP(S) 代理地址，如 http://127.0.0.1:7890",
     "type": "string",
     "default": "",
-    "hint": "海外/VPS 部署建议配置国内出口代理以显著降低风控概率；本机部署留空直连即可。修改后需重载插件生效"
+    "secret": true,
+    "hint": "海外/VPS 部署建议配置国内出口代理以显著降低风控概率；本机部署留空直连即可。修改后需重载插件生效。带认证的代理形如 http://用户名:密码@主机:端口，其中的凭据属敏感信息，故本项按 secret 处理（日志与面板输出已统一打码）"
   }
 }
