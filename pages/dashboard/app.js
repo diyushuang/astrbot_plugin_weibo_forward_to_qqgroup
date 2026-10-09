@@ -5,9 +5,24 @@
 
 const POLL_MS = 20000;
 
+/* 取消后的可撤销窗口（秒）。由后端 overview.status.cancel_undo_seconds 下发——
+ * 窗口常量只在 main.py 定义一份，页面照自己的常量估算早晚会与后端对不上。 */
+let cancelUndoSeconds = 1800;
+
+function undoMinutes() {
+  return Math.max(1, Math.round(cancelUndoSeconds / 60));
+}
+
+function fmtRemain(seconds) {
+  if (!seconds || seconds <= 0) return "即将清理";
+  return `约 ${Math.ceil(seconds / 60)} 分钟`;
+}
+
 const KIND_LABEL = {
   push: "推送成功",
   push_fail: "推送放弃",
+  push_cancel: "推送取消",
+  push_restore: "推送恢复",
   album: "相册上传",
   album_fail: "相册失败",
   video_fail: "视频未转发",
@@ -143,6 +158,16 @@ function renderStatus(st) {
   const grid = els["status-grid"];
   grid.replaceChildren();
 
+  // 「停止本轮推送」只在真有轮次在跑时可用：平时点它只会得到一句"没有正在
+  // 进行的轮次"，不如直接把按钮置灰并说明原因
+  const stopBtn = els["btn-stop-round"];
+  if (stopBtn) {
+    stopBtn.disabled = !st.push_round_active;
+    stopBtn.title = st.push_round_active
+      ? "结束当前这一轮推送，剩余条目原样留队、下一轮继续"
+      : "当前没有正在进行的推送轮次";
+  }
+
   grid.append(
     tile(
       "轮询任务",
@@ -163,7 +188,12 @@ function renderStatus(st) {
     tile(
       "待推送队列",
       `${st.pending_count} 条`,
-      st.pending_retrying > 0 ? `其中 ${st.pending_retrying} 条在重试` : "队列状态健康",
+      st.pending_retrying > 0
+        ? `其中 ${st.pending_retrying} 条在重试` +
+          (st.cancelled_count > 0 ? ` · 另有 ${st.cancelled_count} 条已取消待恢复` : "")
+        : st.cancelled_count > 0
+          ? `队列状态健康 · 另有 ${st.cancelled_count} 条已取消待恢复`
+          : "队列状态健康",
       st.pending_retrying > 0 ? "warn" : ""
     ),
     tile(
@@ -429,9 +459,63 @@ function renderPending(pending, totalCount) {
     if (item.retries > 0) retry.append(el("span", "danger", `${item.retries} 次`));
     else if (!item.sending) retry.append(el("span", "dim", "—"));
     tr.append(retry);
+    const op = el("td", "col-op");
+    const cancelBtn = el("button", "btn-mini", "取消");
+    cancelBtn.type = "button";
+    cancelBtn.addEventListener("click", async () => {
+      // 发送中的条目取消不彻底：已经交给协议端的那一次收不回来，确认框必须
+      // 说清这一点，否则用户以为"点了就什么都没发出去"
+      const confirmed = await confirmDialog(
+        item.sending
+          ? `确定取消这条推送吗？\n${item.name || item.uid}\n\n该条正在发送：` +
+            "已经交给协议端的那一次收不回来，群里可能仍会收到；本条不再重发。"
+          : `确定取消这条推送吗？\n${item.name || item.uid}\n\n` +
+            `本条不再重发，也不会触发群相册上传；${undoMinutes()} 分钟内可在` +
+            "「已取消（可恢复）」里恢复。"
+      );
+      if (!confirmed) return;
+      act(cancelBtn, "cancel-pending", { post_id: item.post_id }, () =>
+        setStatus("已取消该条推送，可在「已取消（可恢复）」里恢复", "ok")
+      );
+    });
+    op.append(cancelBtn);
+    tr.append(op);
     tbody.append(tr);
   }
   renderListEmpty(tbody, els["pending-empty"], totalCount);
+}
+
+function renderCancelled(items) {
+  els["cancelled-count"].textContent = String(items.length);
+  const tbody = els["cancelled-rows"];
+  tbody.replaceChildren();
+  for (const item of items) {
+    const tr = el("tr");
+    tr.append(el("td", "", item.name || item.uid || "—"));
+    const textCell = el("td");
+    if (item.video) textCell.append(el("span", "badge", "含视频"));
+    if (item.text) textCell.append(el("span", "dim", item.text));
+    else if (!item.video) textCell.append(el("span", "dim", "（无内容）"));
+    if (item.was_sending)
+      textCell.append(el("div", "dim", "取消时正在发送，已发出的部分收不回来"));
+    if (item.retries > 0)
+      textCell.append(el("div", "dim", `取消时已重试 ${item.retries} 次（恢复后保持不变）`));
+    tr.append(textCell);
+    tr.append(el("td", "dim", item.cancelled_ts ? fmtTime(item.cancelled_ts) : "—"));
+    tr.append(el("td", "dim", fmtRemain(item.remain_seconds)));
+    const op = el("td", "col-op");
+    const restoreBtn = el("button", "btn-mini", "恢复");
+    restoreBtn.type = "button";
+    restoreBtn.addEventListener("click", () => {
+      act(restoreBtn, "restore-pending", { post_id: item.post_id }, () =>
+        setStatus("已恢复该条推送：回到队列尾部，重试进度保持不变", "ok")
+      );
+    });
+    op.append(restoreBtn);
+    tr.append(op);
+    tbody.append(tr);
+  }
+  renderListEmpty(tbody, els["cancelled-empty"], items.length);
 }
 
 function renderStats(stats) {
@@ -518,12 +602,15 @@ function renderOverview(data) {
     els["version-chip"].hidden = false;
     els["version-chip"].textContent = data.version;
   }
-  renderStatus(data.status || {});
+  const status = data.status || {};
+  if (status.cancel_undo_seconds > 0) cancelUndoSeconds = status.cancel_undo_seconds;
+  renderStatus(status);
   renderAccounts(data.accounts || []);
   renderSessions(data.sessions || []);
   renderRules(data.album_rules || []);
   renderKeywordRules(data.keyword_rules || []);
-  renderPending(data.pending || [], (data.status || {}).pending_count || 0);
+  renderPending(data.pending || [], status.pending_count || 0);
+  renderCancelled(data.cancelled || []);
   renderStats(data.stats || {});
   renderActivity(data.activity || []);
   els["album-disabled-tip"].hidden = !!(data.status || {}).album_enabled;
@@ -668,6 +755,30 @@ function wireForms() {
   });
 
   els["btn-refresh"].addEventListener("click", () => load());
+
+  // 「停止本轮推送」不走 act()：act 末尾的 busy(btn, false) 会与 renderStatus
+  // 里按 push_round_active 计算的置灰状态打架，这里按「立即检查」的做法手写
+  els["btn-stop-round"].addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget;
+    const confirmed = await confirmDialog(
+      "确定停止本轮推送吗？\n\n本轮剩余条目不会发送，会原样留在待推送队列里" +
+        "（不消耗重试次数），下一轮检查时继续尝试。\n" +
+        "若想让某一条彻底不再重发，请改用该行的「取消」。"
+    );
+    if (!confirmed) return;
+    busy(btn, true);
+    window.__bridge
+      .apiPost("stop-push-round", {})
+      .then(() => {
+        setStatus("已停止本轮推送：剩余条目留待下一轮检查", "ok");
+        setTimeout(load, 1000);
+      })
+      .catch((e) => setStatus(`停止失败：${e && e.message ? e.message : e}`, "error"))
+      .finally(() => {
+        busy(btn, false);
+        load();
+      });
+  });
 
   els["btn-clear-errors"].addEventListener("click", async (ev) => {
     const btn = ev.currentTarget;

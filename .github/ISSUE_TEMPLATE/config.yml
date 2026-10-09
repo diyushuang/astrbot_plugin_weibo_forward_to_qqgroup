@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题与排障（先看 README）
+    url: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup#常见问题
+    about: 安装了但收不到推送、面板打不开、视频/图片丢失等，多半在「常见问题」与「已知限制」里已有结论。
+  - name: 安全漏洞（请勿公开）
+    url: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/security/advisories/new
+    about: 安全问题请走私下上报渠道，不要开公开 Issue，详见 SECURITY.md。

@@ -89,14 +89,29 @@
   </section>
 
   <section class="card">
-    <h2>待推送队列 <span class="count" id="pending-count">0</span></h2>
+    <h2>待推送队列 <span class="count" id="pending-count">0</span>
+      <button id="btn-stop-round" class="btn-mini card-action" type="button">停止本轮推送</button>
+    </h2>
     <div class="table-wrap">
       <table class="table">
-        <thead><tr><th>博主</th><th>内容摘要</th><th>入队时间</th><th>重试</th></tr></thead>
+        <thead><tr><th>博主</th><th>内容摘要</th><th>入队时间</th><th>重试</th><th class="col-op"></th></tr></thead>
         <tbody id="pending-rows"></tbody>
       </table>
       <p class="empty" id="pending-empty">队列为空，没有待推送的微博。</p>
     </div>
+    <p class="hint">推送一直失败时，用每行的「取消」把这一条摘出队列——取消不记为推送失败，也不会触发群相册上传，30 分钟内可在下方「已取消」里恢复；「停止本轮推送」只结束当前这一轮，剩余条目原样留在队列、不消耗重试次数，下一轮检查会继续尝试。</p>
+  </section>
+
+  <section class="card">
+    <h2>已取消（可恢复） <span class="count" id="cancelled-count">0</span></h2>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>博主</th><th>内容摘要</th><th>取消时间</th><th>剩余可恢复</th><th class="col-op"></th></tr></thead>
+        <tbody id="cancelled-rows"></tbody>
+      </table>
+      <p class="empty" id="cancelled-empty">没有被取消的推送。取消过的条目会在这里保留一段时间，供误点时恢复。</p>
+    </div>
+    <p class="hint">「恢复」把条目原样放回队列尾部，取消时的重试进度保持不变——若取消时重试已超限，恢复后本轮会做一次「去视频降级补发」，未成功才按放弃推送记账。超出可恢复时间后条目与其已下载的视频临时文件会被清理，不再出现在这里。</p>
   </section>
 
   <section class="card">

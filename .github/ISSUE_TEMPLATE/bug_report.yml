@@ -1,0 +1,97 @@
+name: Bug 反馈
+description: 推送失败、视频/图片丢失、面板异常等功能性问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。本项目完全由 AI 生成，**证据比描述更有用**——请尽量把日志原文与面板上的告警行贴全，我们据此把结论重新钉一遍。
+
+        安全类问题请**不要**在这里公开，改走 [SECURITY.md](../SECURITY.md) 的私下渠道。
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: 在群里发送「微博状态」即可看到，或看面板右上角版本标签
+      placeholder: 例如 v1.7.6
+    validations:
+      required: true
+
+  - type: input
+    id: astrbot-version
+    attributes:
+      label: AstrBot 版本
+      placeholder: 例如 v4.28.2
+    validations:
+      required: true
+
+  - type: input
+    id: protocol
+    attributes:
+      label: 协议端与版本
+      description: NapCat / Lagrange 等，以及版本号。群相册相关问题必须填 NapCat ≥ v4.8.101 的实际版本
+      placeholder: 例如 NapCat v4.9.81（Docker，与 AstrBot 分容器部署）
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 你期望发生什么、实际发生了什么。涉及推送时请说明**群里收到的是什么**（完整消息 / 只有正文 / 什么都没有）
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 尽量具体到"做了什么操作、第几轮检查之后出现"
+      placeholder: |
+        1. 群里发送 微博添加 xxx
+        2. 该博主发了一条带视频的微博
+        3. 面板待推送队列出现「视频未转发」
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段
+      description: AstrBot 日志里相关的一段原文（含报错行）。建议连上下文一起贴，带上时间戳
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: panel-errors
+    attributes:
+      label: 面板「错误日志留存」内容
+      description: 面板 →「错误日志留存」卡片里的告警行（含"拒收详情"之类的字段）。分享了请自行脱敏会话号
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: config-diff
+    attributes:
+      label: 与默认值不同的配置项
+      description: 只需列出改过的项，例如 video_file_temp=false、max_pending_retries=20
+      placeholder: video_file_temp=false
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我使用的是最新 tag 对应的版本（旧版本的问题请先升级再复现）
+          required: true
+        - label: 我已读过 README 的「常见问题」与「已知限制」，确认不是已知行为
+          required: true
+        - label: 我已确认日志里没有暴露 Cookie、代理凭据等敏感信息
+          required: true

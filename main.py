@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.7.6"
+PLUGIN_VERSION = "v1.8.0"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -234,6 +234,17 @@ ACTIVITY_TEXT_MAX = 80  # 单条动态摘要截断长度，防 state.json 膨胀
 # 正文摘要，短才对。
 ACTIVITY_DETAIL_MAX = 240
 STATS_DAILY_KEEP = 14  # 按天推送统计桶保留天数
+
+# ---------------- 面板手动取消推送 ----------------
+# 推送一直失败（协议端拒收、消息发不出去、群里那条就是不要了）时，等 max_pending_retries
+# 烧完最长要 10 分钟以上，期间面板没有任何"就到此为止"的手段。取消分两级：
+#   · 单条取消：把这一条从待推送队列摘出去，不再重发；
+#   · 停止本轮：本轮 _flush_pending 立即收尾，剩余条目原样留队、不消耗重试次数。
+# 取消是误点成本很低却代价不小的操作（点了就再也没有那条微博进群），所以单条取消
+# 进"可撤销保留区"，PUSH_CANCEL_UNDO_SECONDS 内可在面板一键放回队列。
+PUSH_CANCEL_UNDO_SECONDS = 1800.0  # 取消后可撤销窗口（秒）
+# 保留区最多留几条：窗口内取消很多条时防 state.json 无上限膨胀，超出只淘汰最旧的
+PUSH_CANCEL_KEEP = 20
 
 _MONTH_MAP = {
     "Jan": 1,
@@ -1057,6 +1068,16 @@ class WeiboMonitorPlugin(Star):
         # ---- WebUI 控制面板（dashboard.py 注册路由，旧版 AstrBot 自动降级）----
         self._web_ready = False
         self._manual_check_task: asyncio.Task | None = None
+        # 面板手动取消：被取消的条目在撤销窗口内留在这里（可一键放回队列）。
+        # 与 pending 分开存：pending 是"还要发的"，这里是"已经决定不发、还能反悔的"，
+        # 混在一起会让 _flush_pending、面板计数、时效清理三处的口径都要加判断
+        self.cancelled: list[dict[str, Any]] = []
+        # 本轮推送是否被面板叫停。_flush_pending 在条目之间检查：置位就收尾，剩余
+        # 条目原样留在队列里（不消耗重试次数——叫停不是失败）
+        self._push_round_stop = False
+        # 本轮推送是否正在进行：面板据此判断"停止本轮"此刻是否有效，
+        # 也用于避免两处同时改 _push_round_stop 造成误清
+        self._push_round_active = False
         # 运行统计与最近动态（随 state.json 持久化，供面板展示）
         self.stats: dict[str, Any] = {
             "push_ok": 0,
@@ -1277,6 +1298,45 @@ class WeiboMonitorPlugin(Star):
         assert self._data_dir is not None
         return self._data_dir / "state.json"
 
+    @staticmethod
+    def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
+        """补齐条目的可选字段（旧 state.json 缺字段时用默认值）。
+
+        待推送队列与「已取消（可撤销）」区共用这一套归一化：恢复就是把取消区的
+        条目原样放回发送链路，字段形状必须一致，否则恢复后会在 _build_chain /
+        _video_ready 里直接撞 KeyError。
+        """
+        item.setdefault("retries", 0)
+        item.setdefault("created_ts", 0.0)
+        # v1.4.0 起待推送条目携带图片信息，旧状态文件没有该字段
+        if not isinstance(item.get("pics"), list):
+            item["pics"] = []
+        # v1.6.0 起携带视频信息；旧条目里的 video_file 路径若已随
+        # video_tmp 清空失效，_video_ready 会自动重置为待下载
+        if not isinstance(item.get("videos"), list):
+            item["videos"] = []
+        if not isinstance(item.get("video_files"), list):
+            item["video_files"] = []
+        item.setdefault("video_note", "")
+        # v1.7.2 起记录直链新鲜度与已试轮数。旧条目没有 videos_ts，按 0
+        # 处理即"早已过签名窗口"，下载前必然先重取直链——旧链注定 403
+        item.setdefault("videos_ts", 0.0)
+        item.setdefault("video_attempts", 0)
+        item.setdefault("video_fail", "")
+        # v1.7.0 起携带原始正文（关键词相册路由匹配用）；旧条目回退渲染后消息
+        item.setdefault("raw_text", "")
+        return item
+
+    @staticmethod
+    def _dump_item(item: dict[str, Any]) -> dict[str, Any]:
+        """落盘前的条目副本：滤掉运行期内部标记（下划线开头）。
+
+        _send_active / _cancel_requested / _cancel_done 只在内存里表达"这一条
+        正在发送 / 已被取消"，写进 state.json 没有意义，重启后读到反而会把一条
+        普通条目误判成"发送中"或"已取消"。
+        """
+        return {k: v for k, v in item.items() if not k.startswith("_")}
+
     def _load_state(self):
         try:
             raw = self._state_file().read_text(encoding="utf-8")
@@ -1308,27 +1368,18 @@ class WeiboMonitorPlugin(Star):
                 if item.get("last_send_ts"):
                     unverified.append(item)
                     continue
-                item.setdefault("retries", 0)
-                item.setdefault("created_ts", 0.0)
-                # v1.4.0 起待推送条目携带图片信息，旧状态文件没有该字段
-                if not isinstance(item.get("pics"), list):
-                    item["pics"] = []
-                # v1.6.0 起携带视频信息；旧条目里的 video_file 路径若已随
-                # video_tmp 清空失效，_video_ready 会自动重置为待下载
-                if not isinstance(item.get("videos"), list):
-                    item["videos"] = []
-                if not isinstance(item.get("video_files"), list):
-                    item["video_files"] = []
-                item.setdefault("video_note", "")
-                # v1.7.2 起记录直链新鲜度与已试轮数。旧条目没有 videos_ts，按 0
-                # 处理即"早已过签名窗口"，下载前必然先重取直链——旧链注定 403
-                item.setdefault("videos_ts", 0.0)
-                item.setdefault("video_attempts", 0)
-                item.setdefault("video_fail", "")
-                # v1.7.0 起携带原始正文（关键词相册路由匹配用）；旧条目回退渲染后消息
-                item.setdefault("raw_text", "")
-                pending.append(item)
+                pending.append(self._normalize_item(item))
         self.pending = pending[-PENDING_HARD_LIMIT:]
+        # 面板取消掉、还在撤销窗口内的条目：与待推送条目共用同一套字段归一化，
+        # 恢复时才能原样回到发送链路。过了窗口（或超保留条数）的在这里就被清掉，
+        # 它们的媒体临时文件也正是在这一步真正删除的
+        cancelled: list[dict[str, Any]] = []
+        for item in state.get("cancelled") or []:
+            if isinstance(item, dict) and item.get("post_id"):
+                item.setdefault("cancelled_ts", 0.0)
+                cancelled.append(self._normalize_item(item))
+        self.cancelled = cancelled
+        self._cancel_prune()
         self.last_check_ts = float(state.get("last_check_ts") or 0)
         visitor = state.get("visitor") or {}
         cookies = visitor.get("cookies") or {}
@@ -1405,7 +1456,10 @@ class WeiboMonitorPlugin(Star):
                 }
                 for uid, info in self.accounts.items()
             },
-            "pending": self.pending,
+            "pending": [self._dump_item(it) for it in self.pending],
+            # 面板取消的条目（撤销窗口内可恢复）：不落盘的话插件一重载就再也
+            # 恢复不了，而"取消"恰恰多发生在需要重载配置排障的时候
+            "cancelled": [self._dump_item(it) for it in self.cancelled],
             "last_check_ts": self.last_check_ts,
             "visitor": {
                 "cookies": self._visitor_cookies,
@@ -2630,18 +2684,182 @@ class WeiboMonitorPlugin(Star):
                     await self._fallback_video_to_file(item)
                 chain = await self._build_chain(item)
 
-    def _pending_discard(self, item: dict[str, Any]):
+    def _pending_discard(self, item: dict[str, Any], *, drop_media: bool = True):
         """按对象身份从待推送队列移除一条（内容相同的两条互不误伤）。
 
-        已下载的视频临时文件一并删除：条目离队的三种出口（已推送/放弃/过期）
-        都不再需要它。
+        已下载的视频临时文件默认一并删除：条目离队的三种出口（已推送/放弃/过期）
+        都不再需要它。面板手动取消时传 drop_media=False——条目只是暂时离开队列，
+        撤销窗口内要能原样放回来重推，把媒体删了等于"恢复"后必然重下（直链多半
+        也已过窗），所以那段时间文件留着，真正过了撤销窗口才删。
         """
         for i, it in enumerate(self.pending):
             if it is item:
                 del self.pending[i]
-                for f in item.get("video_files") or []:
-                    Path(str(f)).unlink(missing_ok=True)
+                if drop_media:
+                    self._drop_pending_media(item)
                 return
+
+    @staticmethod
+    def _drop_pending_media(item: dict[str, Any]):
+        """删掉条目已下载的视频临时文件（条目彻底离队时才调）。"""
+        for f in item.get("video_files") or []:
+            Path(str(f)).unlink(missing_ok=True)
+
+    # ---------------- 面板手动取消推送 ----------------
+    #
+    # 设计口径（面板、日志与文档必须一致）：
+    #   · 取消只影响"还没发出去的部分"。条目正在发送时点取消，交给协议端的那一次
+    #     收不回来——记 cancel_was_sending，措辞如实说"群里可能已经收到"；
+    #   · 取消不算推送失败：不写 push_fail、不派发群相册上传（没推送成功就不该传图）；
+    #   · 单条取消进保留区，PUSH_CANCEL_UNDO_SECONDS 内可撤销，恢复时**保留原重试进度**
+    #     （撤销不是重置），所以万一取消时重试已超限，恢复后本轮的收尾动作就是
+    #     "去视频降级补发一次"，没成功才按放弃推送记账；
+    #   · 停止本轮只让 _flush_pending 提前收尾，剩余条目原样留在队列、**不消耗重试次数**。
+
+    def _pending_find(self, post_id: str) -> dict[str, Any] | None:
+        key = str(post_id or "")
+        return next(
+            (it for it in self.pending if str(it.get("post_id") or "") == key),
+            None,
+        )
+
+    def _cancel_prune(self) -> bool:
+        """清掉已过撤销窗口的取消条目（连同媒体临时文件），返回是否有变化。
+
+        窗口外的条目没有任何办法再恢复，留着只会让 state.json 越积越大；媒体
+        文件也要在这时候真正删掉——取消时特意留着的，就只有这一段窗口。
+        """
+        now = time.time()
+        keep = [
+            e
+            for e in self.cancelled
+            if now - float(e.get("cancelled_ts") or 0.0) <= PUSH_CANCEL_UNDO_SECONDS
+        ]
+        if len(keep) > PUSH_CANCEL_KEEP:
+            keep = keep[-PUSH_CANCEL_KEEP:]
+        keep_ids = {id(e) for e in keep}
+        dropped = [e for e in self.cancelled if id(e) not in keep_ids]
+        for entry in dropped:
+            self._drop_pending_media(entry)
+        self.cancelled = keep
+        return bool(dropped)
+
+    def _finalize_cancel(self, item: dict[str, Any]) -> bool:
+        """把一条已标记取消的条目真正出队并放进保留区；已处理过则返回 False。
+
+        正在发送中（_send_active）的条目要等它的会话循环先收尾再来这里，否则
+        发送协程还在写 item / 往群里发，这边已经把条目搬走了。
+        """
+        if item.get("_cancel_done"):
+            return False
+        item["_cancel_done"] = True
+        was_sending = bool(item.pop("_send_active", False)) or bool(item.get("last_send_ts"))
+        self._pending_discard(item, drop_media=False)
+        item.pop("_cancel_requested", None)
+        item["cancelled_ts"] = time.time()
+        item["cancel_was_sending"] = was_sending
+        self.cancelled.append(item)
+        self._cancel_prune()
+        uid = str(item.get("uid") or "")
+        name = self._account_name(uid)
+        detail = (
+            "面板手动取消推送（取消时该条正在发送，已交给协议端的那一次收不回来，"
+            "群里可能已经收到；本条不再重发）"
+            if was_sending
+            else f"面板手动取消推送（本条不再重发；{PUSH_CANCEL_UNDO_SECONDS / 60:.0f} 分钟内"
+            "可在面板恢复）"
+        )
+        self._record_event(
+            "push_cancel", uid=uid, name=name, text=str(item.get("text") or ""), detail=detail
+        )
+        if was_sending:
+            # 发送中取消是唯一"动作与群里结果可能不一致"的情形，日志留一条便于对账
+            logger.warning(
+                f"面板取消推送：微博 {item.get('post_id')} 取消时正在发送，"
+                "该次发送无法撤回，群里可能已收到"
+            )
+        else:
+            logger.info(f"面板取消推送：微博 {item.get('post_id')} 已出队，未发送")
+        return True
+
+    def cancel_pending(self, post_id: str) -> tuple[bool, str]:
+        """面板「取消」：把一条待推送微博摘出队列，进可撤销保留区。
+
+        正在发送的条目不能立刻搬走（发送协程还在用它），只打标记，由
+        _flush_pending 在它的会话循环收尾后处置。
+        """
+        item = self._pending_find(post_id)
+        if item is None:
+            return False, "该条目已不在待推送队列（可能刚推送成功、已超时或被其它操作处理）"
+        if item.get("_cancel_requested"):
+            return False, "该条目已在取消中"
+        item["_cancel_requested"] = True
+        undo_min = PUSH_CANCEL_UNDO_SECONDS / 60
+        if item.get("_send_active"):
+            return (
+                True,
+                "已请求取消：该条正在发送，会在本次发送返回后立即取消（已发出的部分收不回）",
+            )
+        self._finalize_cancel(item)
+        self._save_state()
+        name = self._account_name(str(item.get("uid") or ""))
+        return True, f"已取消推送：{name} 的这条微博不再重发，{undo_min:.0f} 分钟内可恢复"
+
+    def restore_pending(self, post_id: str) -> tuple[bool, str]:
+        """面板「恢复」：把撤销窗口内的取消条目放回队列尾部。
+
+        保留取消时的重试进度（撤销不是重置）：取消多半正是发生在"重试快烧完"的
+        时刻，若在这里清零，恢复就变成绕开重试上限的通道，一条永远发不出去的
+        微博可以被无限重投。进度原样带回去，本轮收尾动作与没取消过完全一致。
+        """
+        key = str(post_id or "")
+        entry = next((e for e in self.cancelled if str(e.get("post_id") or "") == key), None)
+        if entry is None:
+            return False, "该条目已不可恢复（超出撤销窗口已被清理，或本就未被取消）"
+        self.cancelled = [e for e in self.cancelled if e is not entry]
+        entry.pop("cancelled_ts", None)
+        entry.pop("cancel_was_sending", None)
+        entry.pop("_cancel_done", None)
+        self.pending.append(entry)
+        if len(self.pending) > PENDING_HARD_LIMIT:
+            self.pending = self.pending[-PENDING_HARD_LIMIT:]
+        uid = str(entry.get("uid") or "")
+        name = self._account_name(uid)
+        self._record_event(
+            "push_restore",
+            uid=uid,
+            name=name,
+            text=str(entry.get("text") or ""),
+            detail=(
+                f"面板恢复已取消的推送（重试进度保留在 {int(entry.get('retries') or 0)} 次，"
+                "本轮按原口径继续处理）"
+            ),
+        )
+        self._save_state()
+        logger.info(f"面板恢复已取消的推送：微博 {key}")
+        return True, f"已恢复推送：{name} 的这条微博回到队列，重试进度保持不变"
+
+    def stop_push_round(self) -> tuple[bool, str]:
+        """面板「停止本轮推送」：让正在进行的 _flush_pending 立即收尾。
+
+        只作用于本轮：已处理的条目维持各自结局，未处理的原样留在队列里，且
+        不消耗重试次数（叫停不是失败）。下一轮轮询会照常重试它们。
+        """
+        if not self._push_round_active:
+            return (
+                False,
+                "当前没有正在进行的推送轮次；队列里的条目会在下一轮检查时重试，"
+                "若想让某条不再重发请用该行的「取消」",
+            )
+        self._push_round_stop = True
+        logger.warning("面板停止本轮推送：本轮剩余条目不再发送，留待下一轮检查")
+        return True, "已停止本轮推送：本轮剩余条目保持原样，下一轮检查时继续"
+
+    @staticmethod
+    def push_cancel_undo_seconds() -> float:
+        """取消后的可撤销窗口（秒）。面板要展示"还剩几分钟可恢复"，
+        窗口长度只在这一处定义，避免面板按自己的常量估算出对不上的剩余时间。"""
+        return PUSH_CANCEL_UNDO_SECONDS
 
     def _bg_task_done(self, tasks: set, label: str):
         """后台任务的统一收尾回调：出集合 + 未捕获异常记入错误留存。
@@ -2684,128 +2902,190 @@ class WeiboMonitorPlugin(Star):
         STATE_SAVE_DEBOUNCE 合并：state.json 是全量序列化，积压批量推送时
         逐条落盘是纯写放大——首批照常立即落盘，之后隔一段合并一次，崩溃
         安全窗口最多放宽一个合并间隔。
+
+        面板可以在这中间介入（见「面板手动取消推送」一节）：
+        · 单条取消：条目在条目边界被搬进"可撤销保留区"；正在发送的条目要等它
+          的会话循环收尾（取消时已经发出去的会话收不回来，按真实结果记账）；
+        · 停止本轮：循环在条目之间收尾，剩余条目原样留队，不消耗重试次数。
         """
         max_retries = self._int_cfg("max_pending_retries", 5)
         delay = self._int_cfg("push_delay_seconds", 2)
         sessions = self._sessions()
-        items = list(self.pending)  # 快照：循环中会从 self.pending 移除已完成条目
+        # 快照：循环中会从 self.pending 移除已完成条目。面板取消的条目同样会从
+        # self.pending 消失，这里靠 _cancel_done / _cancel_requested 两个标记认出
+        # 它们，避免对同一条重复处置
+        items = list(self.pending)
         total = len(items)
         changed = False
         last_save = float("-inf")
-        for idx, item in enumerate(items):
-            if self._is_expired(item.get("created_ts", 0.0)):
-                logger.info(f"待推送微博 {item['post_id']} 已超过时效上限，自动清除")
-                self._pending_discard(item)
-                changed = True
-                continue
-            if not sessions:
-                # 未绑定推送目标：保留消息但不消耗重试次数
-                continue
-            if item.get("retries", 0) >= max_retries:
-                retries = item.get("retries", 0)
-                uid, text = str(item.get("uid") or ""), str(item.get("text") or "")
-                logger.warning(f"推送重试 {retries} 轮超限，微博 {item['post_id']} 停止整条重发")
-                delivered, unknown = await self._last_chance_flush(item, sessions)
-                # 群文件兜底就在上面这次调用里做的：记账要连它一起说清楚
-                file_note = self._video_file_summary(item)
-                tail = f"，{file_note}" if file_note else ""
-                if delivered:
-                    # 降级链确实发出去了：记账必须跟着结果走，否则会留下
-                    # "面板写着放弃、群里却有这条微博"的倒挂
-                    self._record_push(
-                        uid,
-                        True,
-                        text,
-                        f"整条重试 {retries} 轮无果，去视频降级后推送到 "
-                        f"{len(delivered)} 个会话{tail}",
-                    )
-                elif unknown:
-                    self._record_push(
-                        uid,
-                        False,
-                        text,
-                        f"整条重试 {retries} 轮无果，去视频降级仍发送超时、"
-                        f"结果未知未重发{tail}；如群里没收到请点原帖链接",
-                    )
-                else:
-                    self._record_push(uid, False, text, f"重试 {retries} 轮仍失败，放弃推送{tail}")
-                if delivered or unknown:
-                    self._dispatch_album_uploads(item, delivered + unknown)
-                self._pending_discard(item)
-                changed = True
-                continue
-            if not self._video_ready(item):
-                # 视频还在后台下载：本轮跳过，下轮再发。不消耗重试次数——
-                # 下载不是失败，烧完重试配额会把已经下好的视频一起弄丢
-                self._ensure_video_prepare(item)
-                continue
-            sent_sessions: list[str] = []
-            timed_out_sessions: list[str] = []
-            chain = await self._build_chain(item)
-            send_timeout = self._int_cfg("message_send_timeout", 60)
-            if send_timeout and self._video_carried(item):
-                send_timeout = max(send_timeout, VIDEO_SEND_TIMEOUT_FLOOR)
-            self._mark_sending(item)
-            for session in sessions:
-                status, chain = await self._send_rich_media(session, item, chain, send_timeout)
-                if status == "sent":
-                    sent_sessions.append(session)
-                elif status == "unknown":
-                    # 超时不代表没发出去：大载荷最常见的就是"实际已送达但判超时"
-                    # （九图、视频都撞过），帧早已交出去，协议端慢慢传而已。
-                    # 结果未知时该会话不再重发——盲重发就是群里同一条消息出现
-                    # 两遍；其余会话继续逐个尝试，互不连坐。
-                    timed_out_sessions.append(session)
-                    logger.warning(
-                        f"推送到 {session} 超过 {send_timeout} 秒未返回，结果未知："
-                        f"微博 {item['post_id']} 对该会话不再重发（防重复）"
-                    )
-            if sent_sessions:
-                self._pending_discard(item)
-                logger.info(f"已推送微博 {item['post_id']}")
-                # 摘段标记可能来自本轮的补发，也可能来自更早的轮次（摘段后
-                # 下一轮才发出去），记账口径一致
-                reason = self._reject_reason(item)
-                self._record_push(
-                    str(item.get("uid") or ""),
-                    True,
-                    str(item.get("text") or ""),
-                    f"推送到 {len(sent_sessions)} 个会话"
-                    + (
-                        f"，另 {len(timed_out_sessions)} 个会话超时结果未知未重发"
-                        if timed_out_sessions
-                        else ""
-                    )
-                    + (f"，{reason}" if reason else ""),
-                )
-                # 超时的会话多半其实已送达，相册上传有自己的台账去重，一并派发
-                self._dispatch_album_uploads(item, sent_sessions + timed_out_sessions)
-                changed = True
-                now_mono = time.monotonic()
-                if now_mono - last_save >= STATE_SAVE_DEBOUNCE:
-                    self._save_state()
-                    last_save = now_mono
-            elif timed_out_sessions:
-                self._pending_discard(item)
-                self._record_push(
-                    str(item.get("uid") or ""),
-                    False,
-                    str(item.get("text") or ""),
-                    f"发送超时（{send_timeout}s）结果未知，未重发以防重复；"
-                    "如群里没收到请点原帖链接",
-                )
-                self._dispatch_album_uploads(item, timed_out_sessions)
-                changed = True
-            else:
-                item["retries"] = item.get("retries", 0) + 1
-                changed = True
-            # 多条之间留间隔防刷屏；最后一条之后无需再等
-            if delay and idx < total - 1:
-                await asyncio.sleep(delay)
-        if not sessions and len(self.pending) > PENDING_HARD_LIMIT:
-            self.pending = self.pending[-PENDING_HARD_LIMIT:]
+        # 过了撤销窗口的取消条目在这里清理（它们的媒体临时文件也是此时才真正删除）
+        if self._cancel_prune():
             changed = True
-        return changed
+        self._push_round_active = True
+        self._push_round_stop = False
+        try:
+            for idx, item in enumerate(items):
+                if self._push_round_stop:
+                    logger.info(
+                        f"本轮推送被面板停止，剩余 {total - idx} 条留待下一轮，不消耗重试次数"
+                    )
+                    changed = True
+                    break
+                if item.get("_cancel_done"):
+                    continue  # 面板已取消并处置完毕，别再动它
+                if item.get("_cancel_requested"):
+                    # 走到这里说明它没在发送中（发送中的条目由下面的会话循环收尾），
+                    # 直接搬进保留区
+                    if self._finalize_cancel(item):
+                        changed = True
+                        self._save_state()
+                    continue
+                if self._is_expired(item.get("created_ts", 0.0)):
+                    logger.info(f"待推送微博 {item['post_id']} 已超过时效上限，自动清除")
+                    self._pending_discard(item)
+                    changed = True
+                    continue
+                if not sessions:
+                    # 未绑定推送目标：保留消息但不消耗重试次数
+                    continue
+                if item.get("retries", 0) >= max_retries:
+                    retries = item.get("retries", 0)
+                    uid, text = str(item.get("uid") or ""), str(item.get("text") or "")
+                    logger.warning(
+                        f"推送重试 {retries} 轮超限，微博 {item['post_id']} 停止整条重发"
+                    )
+                    delivered, unknown = await self._last_chance_flush(item, sessions)
+                    # 群文件兜底就在上面这次调用里做的：记账要连它一起说清楚
+                    file_note = self._video_file_summary(item)
+                    tail = f"，{file_note}" if file_note else ""
+                    if delivered:
+                        # 降级链确实发出去了：记账必须跟着结果走，否则会留下
+                        # "面板写着放弃、群里却有这条微博"的倒挂
+                        self._record_push(
+                            uid,
+                            True,
+                            text,
+                            f"整条重试 {retries} 轮无果，去视频降级后推送到 "
+                            f"{len(delivered)} 个会话{tail}",
+                        )
+                    elif unknown:
+                        self._record_push(
+                            uid,
+                            False,
+                            text,
+                            f"整条重试 {retries} 轮无果，去视频降级仍发送超时、"
+                            f"结果未知未重发{tail}；如群里没收到请点原帖链接",
+                        )
+                    else:
+                        self._record_push(
+                            uid, False, text, f"重试 {retries} 轮仍失败，放弃推送{tail}"
+                        )
+                    if delivered or unknown:
+                        self._dispatch_album_uploads(item, delivered + unknown)
+                    self._pending_discard(item)
+                    changed = True
+                    continue
+                if not self._video_ready(item):
+                    # 视频还在后台下载：本轮跳过，下轮再发。不消耗重试次数——
+                    # 下载不是失败，烧完重试配额会把已经下好的视频一起弄丢
+                    self._ensure_video_prepare(item)
+                    continue
+                sent_sessions: list[str] = []
+                timed_out_sessions: list[str] = []
+                chain = await self._build_chain(item)
+                send_timeout = self._int_cfg("message_send_timeout", 60)
+                if send_timeout and self._video_carried(item):
+                    send_timeout = max(send_timeout, VIDEO_SEND_TIMEOUT_FLOOR)
+                self._mark_sending(item)
+                # 打上"正在发送"标记：面板此刻点取消不能直接把条目搬走（发送协程
+                # 还在用它、还在往群里发），只能打 _cancel_requested，由下面收尾
+                item["_send_active"] = True
+                try:
+                    for session in sessions:
+                        if item.get("_cancel_requested"):
+                            # 正在发送时被取消：不再往后面的会话发（已发出的收不回）
+                            break
+                        status, chain = await self._send_rich_media(
+                            session, item, chain, send_timeout
+                        )
+                        if status == "sent":
+                            sent_sessions.append(session)
+                        elif status == "unknown":
+                            # 超时不代表没发出去：大载荷最常见的就是"实际已送达但判超时"
+                            # （九图、视频都撞过），帧早已交出去，协议端慢慢传而已。
+                            # 结果未知时该会话不再重发——盲重发就是群里同一条消息出现
+                            # 两遍；其余会话继续逐个尝试，互不连坐。
+                            timed_out_sessions.append(session)
+                            logger.warning(
+                                f"推送到 {session} 超过 {send_timeout} 秒未返回，结果未知："
+                                f"微博 {item['post_id']} 对该会话不再重发（防重复）"
+                            )
+                finally:
+                    item.pop("_send_active", None)
+                cancel_late = bool(item.get("_cancel_requested"))
+                if cancel_late and not sent_sessions and not timed_out_sessions:
+                    # 一条都没有出去（也没有结果未知的会话）：取消成立，进可撤销保留区。
+                    # 有 sent/timed_out 的场合不能进保留区——恢复会把它再发给全部
+                    # 会话，群里就重复了，所以那种情况落到下面的正常记账里
+                    self._finalize_cancel(item)
+                    changed = True
+                    self._save_state()
+                    continue
+                if cancel_late:
+                    item.pop("_cancel_requested", None)
+                    item["_cancel_done"] = True
+                if sent_sessions:
+                    self._pending_discard(item)
+                    logger.info(f"已推送微博 {item['post_id']}")
+                    # 摘段标记可能来自本轮的补发，也可能来自更早的轮次（摘段后
+                    # 下一轮才发出去），记账口径一致
+                    reason = self._reject_reason(item)
+                    self._record_push(
+                        str(item.get("uid") or ""),
+                        True,
+                        str(item.get("text") or ""),
+                        f"推送到 {len(sent_sessions)} 个会话"
+                        + (
+                            f"，另 {len(timed_out_sessions)} 个会话超时结果未知未重发"
+                            if timed_out_sessions
+                            else ""
+                        )
+                        + (f"，{reason}" if reason else "")
+                        + ("；面板取消来晚了一步，已送达的部分无法撤回" if cancel_late else ""),
+                    )
+                    # 超时的会话多半其实已送达，相册上传有自己的台账去重，一并派发
+                    self._dispatch_album_uploads(item, sent_sessions + timed_out_sessions)
+                    changed = True
+                    now_mono = time.monotonic()
+                    if now_mono - last_save >= STATE_SAVE_DEBOUNCE:
+                        self._save_state()
+                        last_save = now_mono
+                elif timed_out_sessions:
+                    self._pending_discard(item)
+                    self._record_push(
+                        str(item.get("uid") or ""),
+                        False,
+                        str(item.get("text") or ""),
+                        f"发送超时（{send_timeout}s）结果未知，未重发以防重复；"
+                        "如群里没收到请点原帖链接",
+                    )
+                    self._dispatch_album_uploads(item, timed_out_sessions)
+                    changed = True
+                else:
+                    item["retries"] = item.get("retries", 0) + 1
+                    changed = True
+                # 多条之间留间隔防刷屏；最后一条之后无需再等
+                if delay and idx < total - 1:
+                    await asyncio.sleep(delay)
+            if not sessions and len(self.pending) > PENDING_HARD_LIMIT:
+                self.pending = self.pending[-PENDING_HARD_LIMIT:]
+                changed = True
+            return changed
+        finally:
+            # 标志必须收干净：异常退出时若还留着 active，面板会一直以为"本轮在跑"，
+            # 「停止本轮」永远指向一个不存在的轮次
+            self._push_round_active = False
+            self._push_round_stop = False
 
     async def _last_chance_flush(
         self, item: dict[str, Any], sessions: list[str]

@@ -90,6 +90,19 @@ def register_dashboard(
         (f"/{plugin_name}/overview", api.overview, ["GET"], "微博转发面板总览"),
         (f"/{plugin_name}/errors", api.errors, ["GET"], "错误日志留存"),
         (f"/{plugin_name}/check-now", api.check_now, ["POST"], "立即检查一轮"),
+        (f"/{plugin_name}/cancel-pending", api.cancel_pending, ["POST"], "取消一条待推送微博"),
+        (
+            f"/{plugin_name}/restore-pending",
+            api.restore_pending,
+            ["POST"],
+            "恢复一条已取消的推送",
+        ),
+        (
+            f"/{plugin_name}/stop-push-round",
+            api.stop_push_round,
+            ["POST"],
+            "停止本轮推送",
+        ),
         (f"/{plugin_name}/clear-errors", api.clear_errors, ["POST"], "清空错误留存"),
         (f"/{plugin_name}/accounts", api.accounts, ["POST"], "增删监控博主"),
         (f"/{plugin_name}/sessions", api.sessions, ["POST"], "增删推送目标"),
@@ -204,6 +217,28 @@ class DashboardAPI:
 
         activity = list(p.activity)[-ACTIVITY_PAGE_LIMIT:]
 
+        # 已取消（撤销窗口内可恢复）：条目已不在 pending 里，面板要单独一块展示，
+        # 否则用户点完取消就再也找不回来。剩余可恢复秒数由后端算——窗口常量只
+        # 在 main.py 有一份，面板照着算迟早会与后端对不上
+        undo_seconds = p.push_cancel_undo_seconds()
+        now = self._now()
+        cancelled = [
+            {
+                "post_id": str(entry.get("post_id") or ""),
+                "uid": str(entry.get("uid") or ""),
+                "name": p._account_name(str(entry.get("uid") or "")),
+                "text": str(entry.get("text") or "")[:120],
+                "cancelled_ts": float(entry.get("cancelled_ts") or 0),
+                "retries": int(entry.get("retries") or 0),
+                "video": bool(entry.get("video_files")),
+                "was_sending": bool(entry.get("cancel_was_sending")),
+                "remain_seconds": max(
+                    0, int(undo_seconds - (now - float(entry.get("cancelled_ts") or 0)))
+                ),
+            }
+            for entry in p.cancelled
+        ]
+
         return json_response(
             {
                 "version": self.version,
@@ -219,6 +254,12 @@ class DashboardAPI:
                     "pending_retrying": sum(
                         1 for item in p.pending if int(item.get("retries") or 0) > 0
                     ),
+                    # 面板手动取消：「停止本轮」只在真有轮次在跑时才有效，
+                    # 撤销窗口秒数由后端下发（窗口常量只在 main.py 有一份）
+                    "push_round_active": bool(p._push_round_active),
+                    "push_round_stopping": bool(p._push_round_stop),
+                    "cancelled_count": len(p.cancelled),
+                    "cancel_undo_seconds": int(undo_seconds),
                     "risk_blocked": risk_blocked,
                     "risk_level": int(p._risk_level or 0),
                     "risk_until_ts": float(p._blocked_until or 0) if risk_blocked else 0.0,
@@ -245,6 +286,7 @@ class DashboardAPI:
                 "album_rules": album_rules,
                 "keyword_rules": keyword_rules,
                 "pending": pending,
+                "cancelled": cancelled,
                 "stats": p.stats,
                 "activity": activity,
             }
@@ -265,6 +307,46 @@ class DashboardAPI:
         return json_response({"cleared": cleared})
 
     # ---------------- 操作 ----------------
+
+    async def cancel_pending(self):
+        """取消一条待推送微博（进可撤销保留区，不再重发）。
+
+        这是"推送一直失败时的人工出口"：等 max_pending_retries 烧完最长要十几
+        分钟，期间面板原本没有任何手段叫停。取消只影响还没发出去的部分——条目
+        正在发送时只能打标记，由推送循环在本条收尾时处置（已发出的收不回）。
+        """
+        p = self.p
+        body = await self._body()
+        post_id = str(body.get("post_id") or "").strip()
+        if not post_id:
+            return error_response("缺少 post_id")
+        ok, message = p.cancel_pending(post_id)
+        if not ok:
+            return error_response(message, 409)
+        self._log.info(f"面板取消推送 {post_id}：{message}")
+        return json_response({"ok": True, "message": message})
+
+    async def restore_pending(self):
+        """把撤销窗口内取消掉的条目放回待推送队列（误点取消的补救入口）。"""
+        p = self.p
+        body = await self._body()
+        post_id = str(body.get("post_id") or "").strip()
+        if not post_id:
+            return error_response("缺少 post_id")
+        ok, message = p.restore_pending(post_id)
+        if not ok:
+            return error_response(message, 409)
+        self._log.info(f"面板恢复推送 {post_id}：{message}")
+        return json_response({"ok": True, "message": message})
+
+    async def stop_push_round(self):
+        """停止本轮推送：剩余条目原样留队、不消耗重试次数，下一轮照常重试。"""
+        p = self.p
+        ok, message = p.stop_push_round()
+        if not ok:
+            return error_response(message, 409)
+        self._log.info(f"面板停止本轮推送：{message}")
+        return json_response({"ok": True, "message": message})
 
     async def check_now(self):
         p = self.p
