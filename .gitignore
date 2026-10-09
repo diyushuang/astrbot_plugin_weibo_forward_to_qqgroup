@@ -15,3 +15,6 @@ bench/
 .playwright-mcp/
 _test_data/
 .workbuddy/
+
+# 破坏性操作（历史重写等）前的整仓备份 bundle，不随仓库分发
+backup/

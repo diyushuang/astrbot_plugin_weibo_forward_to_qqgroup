@@ -92,7 +92,7 @@ bench/             本地离线回归脚本（被 .gitignore 忽略，不进插�
 
 **类型**（取其一）：`feat` 新功能 / `fix` 修复 / `docs` 文档 / `refactor` 重构 / `perf` 性能 / `test` 测试 / `chore` 构建与杂项。
 
-**范围**（取其一，取最贴近的）：`poll` 微博抓取与轮询 / `push` 推送链路 / `video` 视频转发 / `album` 群相册 / `panel` WebUI 面板 / `docs` 文档 / `repo` 仓库与发布。
+**范围**（可选，取最贴近的一个）：`poll` 微博抓取与轮询 / `push` 推送链路 / `video` 视频转发 / `album` 群相册 / `panel` WebUI 面板 / `repo` 仓库与发布。纯文档提交与作用面覆盖整个仓库的提交省略范围，直接写 `docs: …` / `chore: …`。
 
 **示例**
 
