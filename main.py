@@ -211,10 +211,21 @@ PIC_REJECTED_NOTE = "🖼 图片超出 QQ 收发限制未能发出，原图请�
 # 参数错、下载失败也走它，只有文案能区分"这条重试一万次也不会成"。图片和视频段
 # 都撞这个回执，所以摘段要按嫌疑顺序升级（见 _strip_rejected_segment）
 RICH_MEDIA_REJECT_MARKER = "rich media transfer failed"
+# 拒收回执留档：只留能定性的三样字段，不是把整段 ActionFailed 灌进 state.json 与面板。
+# 现场判"是体积超限、NapCat 版本回归，还是风控"全靠它——2026-10-09 那条 5.6MB 的
+# 视频被判"富媒体超限"就是这么发现的：回执里根本没有体积信息，结论是猜的。
+REJECT_DETAIL_MAX = 200
+_REJECT_RETCODE_RE = re.compile(r"retcode=(\d+)")
+_REJECT_RESULT_RE = re.compile(r'"result"\s*:\s*(-?\d+)')
+_REJECT_ERRMSG_RE = re.compile(r'"errMsg"\s*:\s*"([^"]{0,80})"')
 
 # ---------------- WebUI 控制面板（dashboard.py 提供页面与 API） ----------------
 ACTIVITY_MAX = 200  # 最近动态最多保留条数（随 state.json 持久化）
 ACTIVITY_TEXT_MAX = 80  # 单条动态摘要截断长度，防 state.json 膨胀
+# 动态说明（detail）另给一份更宽的额度：拒收回执、降级来源这类诊断文字要连
+# 字段名一起说完整才读得懂，按 80 截到一半等于没记。text 仍按 80 截，那是微博
+# 正文摘要，短才对。
+ACTIVITY_DETAIL_MAX = 240
 STATS_DAILY_KEEP = 14  # 按天推送统计桶保留天数
 
 _MONTH_MAP = {
@@ -1421,7 +1432,11 @@ class WeiboMonitorPlugin(Star):
         text: str = "",
         detail: str = "",
     ):
-        """记一条最近动态（面板展示用）；text/detail 截断防 state.json 膨胀。"""
+        """记一条最近动态（面板展示用）；text/detail 各自截断防 state.json 膨胀。
+
+        detail 用 ACTIVITY_DETAIL_MAX 而不是和 text 同一个 80：拒收回执这类诊断
+        文字截到一半就只剩噪音，面板上读不出是 1200 的哪一档失败。
+        """
         self.activity.append(
             {
                 "ts": time.time(),
@@ -1429,7 +1444,7 @@ class WeiboMonitorPlugin(Star):
                 "uid": str(uid or ""),
                 "name": str(name or ""),
                 "text": str(text or "")[:ACTIVITY_TEXT_MAX],
-                "detail": str(detail or "")[:ACTIVITY_TEXT_MAX],
+                "detail": str(detail or "")[:ACTIVITY_DETAIL_MAX],
             }
         )
 
@@ -2446,6 +2461,63 @@ class WeiboMonitorPlugin(Star):
         """
         return RICH_MEDIA_REJECT_MARKER in str(exc).lower()
 
+    @staticmethod
+    def _reject_digest(exc: BaseException) -> str:
+        """把协议端的拒收回执压成一行可读摘要（面板、错误留存与 state.json 都用它）。
+
+        aiocqhttp 的 ActionFailed 是一整段带换行的裸字符串（retcode + eventRet
+        JSON），原样留档既读不出重点又把持久化文件撑大。只留能定性的三样：
+        retcode、result、errMsg——现场判"体积超限 / NapCat 版本回归 / 风控"
+        就靠这三个字段。抓不到这些字段（别的协议端实现）时退化成折叠空白后的原文。
+        """
+        raw = str(exc)
+        bits = []
+        if m := _REJECT_RETCODE_RE.search(raw):
+            bits.append(f"retcode={m.group(1)}")
+        if m := _REJECT_RESULT_RE.search(raw):
+            bits.append(f"result={m.group(1)}")
+        if m := _REJECT_ERRMSG_RE.search(raw):
+            bits.append(f"errMsg={m.group(1)}")
+        text = " ".join(bits) if bits else re.sub(r"\s+", " ", raw).strip()
+        return text[:REJECT_DETAIL_MAX]
+
+    @staticmethod
+    def _reject_weight(item: dict[str, Any], seg: str) -> str:
+        """被判罪段当时的真实体量：判断"是不是体积撑爆"靠它，而不是靠猜。
+
+        视频报真实落盘的文件体积（发出去的就是它）；图片只有 URL、不落本地，
+        报张数。拿不到就返回空串，不编数字。
+        """
+        if seg == "视频":
+            sizes = []
+            for f in item.get("video_files") or []:
+                try:
+                    sizes.append(Path(str(f)).stat().st_size)
+                except OSError:
+                    continue
+            if not sizes:
+                return ""
+            total = sum(sizes) / 1048576
+            return f"{len(sizes)} 段共 {total:.1f}MB" if len(sizes) > 1 else f"{total:.1f}MB"
+        if seg == "图片":
+            n = len(item.get("pics") or [])
+            return f"{n} 张" if n else ""
+        return ""
+
+    def _note_reject(self, item: dict[str, Any], seg: str, exc: BaseException) -> str:
+        """把一次拒收的现场记在条目上，返回给日志用的一行说明。
+
+        记的是"协议端到底回了什么 + 当时体量多大 + 被拒过几次"：这三样凑起来
+        才能把"富媒体确实超限"和"协议端自己的毛病（NapCat 版本回归/风控）"分开。
+        条目随后就出队了，所以同时进最近动态（见 _reject_reason），面板里查得到。
+        """
+        detail = self._reject_digest(exc)
+        weight = self._reject_weight(item, seg)
+        item["reject_detail"] = detail
+        item["reject_weight"] = weight
+        item["reject_attempts"] = int(item.get("reject_attempts") or 0) + 1
+        return f"回执 {detail}" + (f"，当时 {weight}" if weight else "")
+
     def _pics_enabled(self, item: dict[str, Any]) -> bool:
         """这条链当前会不会带图片段：开关开着、有图、且图片段还没被拒收过。"""
         return bool(
@@ -2479,13 +2551,25 @@ class WeiboMonitorPlugin(Star):
         return ""
 
     def _reject_reason(self, item: dict[str, Any]) -> str:
-        """面板/记账用的说明：这条推送被协议端拒收过哪些段、现在发的是哪一版。"""
+        """面板/记账用的说明：这条推送被协议端拒收过哪些段、回执是什么、当时多重。"""
         parts = []
         if item.get("pic_rejected"):
             parts.append("图片段被协议端拒收，已去图改发正文")
         if item.get("video_rejected"):
             parts.append("视频段被协议端拒收，已去掉视频")
-        return "，".join(parts)
+        detail = str(item.get("reject_detail") or "")
+        if not detail:
+            return "，".join(parts)
+        bits = [f"协议端回执 {detail}"]
+        weight = str(item.get("reject_weight") or "")
+        if weight:
+            bits.append(f"当时 {weight}")
+        n = int(item.get("reject_attempts") or 0)
+        if n > 1:
+            bits.append(f"共被拒 {n} 次")
+        extra = "，".join(bits)
+        head = "，".join(parts)
+        return f"{head}；{extra}" if head else extra
 
     async def _send_rich_media(
         self,
@@ -2515,8 +2599,11 @@ class WeiboMonitorPlugin(Star):
                 if not seg:
                     logger.warning(f"推送到 {session} 失败: {e!r}")
                     return "failed", chain
+                # 回执与体量一并留下：这条日志（错误留存面板）是现场唯一的证据，
+                # 只说"视频段被拒收"看不出是体积问题还是协议端自己的毛病
+                note = self._note_reject(item, seg, e)
                 logger.warning(
-                    f"推送到 {session} 失败：{seg}段被协议端拒收，"
+                    f"推送到 {session} 失败：{seg}段被协议端拒收（{note}），"
                     f"已去掉{seg}重发微博 {item['post_id']} 的正文"
                 )
                 chain = await self._build_chain(item)

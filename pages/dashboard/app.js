@@ -421,6 +421,7 @@ function renderPending(pending, totalCount) {
     else if (!item.video) textCell.append(el("span", "dim", "（无内容）"));
     if (item.video_fail && !item.video)
       textCell.append(el("div", "dim", "失败原因：" + item.video_fail));
+    if (item.reject) textCell.append(el("div", "dim", "拒收详情：" + item.reject));
     tr.append(textCell);
     tr.append(el("td", "dim", item.created_ts ? fmtTime(item.created_ts) : "—"));
     const retry = el("td");

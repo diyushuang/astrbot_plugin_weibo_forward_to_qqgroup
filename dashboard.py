@@ -194,6 +194,9 @@ class DashboardAPI:
                 # 视频没下来时面板要能说出为什么（旧状态文件没有该字段）
                 "video_fail": str(item.get("video_fail") or "")[:160],
                 "video_note": bool(item.get("video_note")),
+                # 协议端拒收的现场（回执/体量/被拒次数）：条目出队后只能从最近
+                # 动态里看，还在队里时这里就能看到，省得去翻错误留存
+                "reject": p._reject_reason(item)[:240],
                 "sending": bool(item.get("last_send_ts")),
             }
             for item in p.pending[-PENDING_PAGE_LIMIT:]
