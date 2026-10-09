@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.7.3"
+PLUGIN_VERSION = "v1.7.5"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -198,6 +198,10 @@ VIDEO_DL_TIMEOUT = 300.0  # 单个视频下载总超时（秒）：几十上百 
 VIDEO_SEND_TIMEOUT_FLOOR = 180
 VIDEO_FALLBACK_NOTE = "🎬 视频未能自动转发，请点原帖链接观看"
 VIDEO_PARTIAL_NOTE = "🎬 部分视频未能自动转发，请点原帖链接观看"
+# 视频消息被协议端拒收后改传群文件成功时的说明：视频确实进群了（群文件里可
+# 下载/在线播放），只是不是"点开就播"的视频消息，措辞要跟降级提示区分开
+VIDEO_FILE_SENT_NOTE = "🎬 视频已改以群文件发送，可在群文件里下载或在线播放"
+VIDEO_FILE_UPLOAD_TIMEOUT = 180.0  # 群文件上传总超时（秒）：几十 MB 的 base64 比发消息还慢
 # 微博视频直链的签名有效窗实测约 3600 秒：留 10 分钟余量，条目里挂过窗的直链
 # 先重取再下载（拿旧链去下必然 403，白烧一轮还把这条视频永久判死）
 VIDEO_URL_FRESH_SECONDS = 3000.0
@@ -2422,7 +2426,9 @@ class WeiboMonitorPlugin(Star):
                     # 按"部分未能转发"提示，与下载侧的降级口径一致
                     note = note or (VIDEO_FALLBACK_NOTE if not sent_n else VIDEO_PARTIAL_NOTE)
             elif item.get("video_files"):
-                note = note or VIDEO_FALLBACK_NOTE
+                # 视频段被摘掉时的说明：群文件兜底真的传成了就说"已改以群文件发送"
+                # （视频还在群里拿得到），没传成才是"未能自动转发"
+                note = note or self._video_file_note(item)
             if note:
                 chain.message("\n" + note)
         return chain
@@ -2551,12 +2557,24 @@ class WeiboMonitorPlugin(Star):
         return ""
 
     def _reject_reason(self, item: dict[str, Any]) -> str:
-        """面板/记账用的说明：这条推送被协议端拒收过哪些段、回执是什么、当时多重。"""
+        """面板/记账用的说明：拒收过哪些段、视频最终走了哪条路、回执是什么。"""
         parts = []
         if item.get("pic_rejected"):
             parts.append("图片段被协议端拒收，已去图改发正文")
+        sent = [str(s) for s in (item.get("video_file_sessions") or [])]
         if item.get("video_rejected"):
-            parts.append("视频段被协议端拒收，已去掉视频")
+            # 视频的去向有两种，措辞要分开：群文件兜底成了（视频还在群里拿得到）
+            # 或只剩一句提示链接——不然面板会同时出现"已去掉视频"和"已发送"两句，
+            # 读起来自相矛盾
+            parts.append(
+                f"视频段被协议端拒收，视频已改以群文件发送（{len(sent)} 个群）"
+                if sent
+                else "视频段被协议端拒收，已去掉视频"
+            )
+        if not sent:
+            err = str(item.get("video_file_fail") or "")
+            if err:
+                parts.append(f"群文件兜底也失败：{err}")
         detail = str(item.get("reject_detail") or "")
         if not detail:
             return "，".join(parts)
@@ -2606,6 +2624,11 @@ class WeiboMonitorPlugin(Star):
                     f"推送到 {session} 失败：{seg}段被协议端拒收（{note}），"
                     f"已去掉{seg}重发微博 {item['post_id']} 的正文"
                 )
+                # 视频段被拒：QQ 视频消息这条路走不通了，改走群文件（另一条上传
+                # 通道）把视频本身送进群，再重建链发正文——群里先拿到视频，再拿到
+                # 微博正文，视频不会再因为协议端的富媒体通道坏掉而整条丢掉
+                if seg == "视频":
+                    await self._fallback_video_to_file(item)
                 chain = await self._build_chain(item)
 
     def _pending_discard(self, item: dict[str, Any]):
@@ -2684,6 +2707,9 @@ class WeiboMonitorPlugin(Star):
                 uid, text = str(item.get("uid") or ""), str(item.get("text") or "")
                 logger.warning(f"推送重试 {retries} 轮超限，微博 {item['post_id']} 停止整条重发")
                 delivered, unknown = await self._last_chance_flush(item, sessions)
+                # 群文件兜底就在上面这次调用里做的：记账要连它一起说清楚
+                file_note = self._video_file_summary(item)
+                tail = f"，{file_note}" if file_note else ""
                 if delivered:
                     # 降级链确实发出去了：记账必须跟着结果走，否则会留下
                     # "面板写着放弃、群里却有这条微博"的倒挂
@@ -2691,7 +2717,8 @@ class WeiboMonitorPlugin(Star):
                         uid,
                         True,
                         text,
-                        f"整条重试 {retries} 轮无果，去视频降级后推送到 {len(delivered)} 个会话",
+                        f"整条重试 {retries} 轮无果，去视频降级后推送到 "
+                        f"{len(delivered)} 个会话{tail}",
                     )
                 elif unknown:
                     self._record_push(
@@ -2699,10 +2726,10 @@ class WeiboMonitorPlugin(Star):
                         False,
                         text,
                         f"整条重试 {retries} 轮无果，去视频降级仍发送超时、"
-                        "结果未知未重发；如群里没收到请点原帖链接",
+                        f"结果未知未重发{tail}；如群里没收到请点原帖链接",
                     )
                 else:
-                    self._record_push(uid, False, text, f"重试 {retries} 轮仍失败，放弃推送")
+                    self._record_push(uid, False, text, f"重试 {retries} 轮仍失败，放弃推送{tail}")
                 if delivered or unknown:
                     self._dispatch_album_uploads(item, delivered + unknown)
                 self._pending_discard(item)
@@ -2795,6 +2822,10 @@ class WeiboMonitorPlugin(Star):
         unknown: list[str] = []
         if not sessions or not self._video_carried(item):
             return delivered, unknown
+        # 视频消息整条发不出去（反复超时/协议端拒绝）时，先把视频改传群文件：
+        # 视频消息这条路已经证明走不通，群文件是另一条上传通道，让"至少能在群里
+        # 拿到视频"这条底线成立，再发正文降级链
+        await self._fallback_video_to_file(item)
         self._mark_sending(item)
         try:
             chain = await self._build_chain(item, with_video=False)
@@ -2838,6 +2869,142 @@ class WeiboMonitorPlugin(Star):
             return str(astrbot_config.get("callback_api_base") or "").strip()
         except Exception:
             return ""
+
+    # ---------------- 视频群文件兜底 ----------------
+
+    def _video_file_fallback_enabled(self) -> bool:
+        return bool(self.config.get("video_file_fallback", True))
+
+    @staticmethod
+    def _video_file_name(post_id: str, idx: int, total: int) -> str:
+        """群文件名：带微博 id，群里一眼能对上原帖，重名也不会互相覆盖。
+
+        QQ 群文件列表是按名字展示的，用 post_id 而不是博主昵称/正文：昵称与正文
+        可能带斜杠、冒号这类在文件系统里非法的字符，也更容易撞重名。
+        """
+        return f"微博_{post_id}{'' if total <= 1 else f'_{idx}'}.mp4"
+
+    @staticmethod
+    def _video_payload(raw: bytes) -> str:
+        """base64 内嵌载荷：编完就丢原始字节，别让同一段视频在内存里留两份。"""
+        return "base64://" + base64.b64encode(raw).decode("ascii")
+
+    async def _upload_video_files(self, session: str, item: dict[str, Any]) -> str:
+        """把本条微博的视频改传成群文件，返回空串表示成功，否则返回失败原因。
+
+        QQ 的群文件走的是**文件服务**，与图片/视频消息用的富媒体通道不是一条：
+        协议端回 `rich media transfer failed` 时富媒体那条路走不通，这条路往往
+        还通——这是"视频消息发不出去"时唯一还能把视频本身送进群的路子。
+
+        载荷用 base64 内嵌而不是本地路径：插件写不出 NapCat 那台机器上的路径
+        （分离部署是常态，裸路径过去就是 ENOENT），base64 与相册上传同一条路，
+        不依赖任何路径映射。体积按 video_inline_max_mb 封顶——这条路固定走
+        base64，同样有"文件体积 5~6 倍瞬时内存"的问题，小内存服务器不能被兜底
+        反噬（超帽就如实报因，群里退回提示链接，正文不受影响）。读进来的原始
+        字节编码完立刻释放，别让同一段视频在内存里同时留两份。
+        """
+        platform, msg_type, gid = self._parse_umo(session)
+        if msg_type != "GroupMessage" or not gid:
+            return "目标不是群会话，群文件无处可传"
+        files = [Path(str(f)) for f in (item.get("video_files") or []) if f]
+        files = [p for p in files if p.is_file()]
+        if not files:
+            return "本地视频文件已不在（临时目录被清过或已发完删除）"
+        cap_mb = self._int_cfg("video_inline_max_mb", VIDEO_INLINE_MB_DEFAULT)
+        try:
+            nc = await self._album_client(platform)
+        except NapCatError as e:
+            return f"拿不到协议端连接：{e}"
+        post_id = str(item.get("post_id") or "")
+        total = len(files)
+        for idx, path in enumerate(files, 1):
+            if cap_mb > 0:
+                try:
+                    size_mb = (await asyncio.to_thread(path.stat)).st_size / 1048576
+                except OSError as e:
+                    return f"读取视频大小失败：{e}"
+                if size_mb > cap_mb:
+                    return (
+                        f"视频 {size_mb:.0f}MB 超过 base64 内嵌上限 {cap_mb}MB，"
+                        "群文件兜底跳过（这条路固定走 base64 内嵌）"
+                    )
+            try:
+                raw = await asyncio.to_thread(path.read_bytes)
+            except OSError as e:
+                return f"读取视频失败：{e}"
+            payload = await asyncio.to_thread(self._video_payload, raw)
+            del raw  # 载荷一路上还要被 JSON 序列化再复制几份，原始字节不留
+            try:
+                await asyncio.wait_for(
+                    nc.call(
+                        "upload_group_file",
+                        idempotent=False,
+                        group_id=str(gid),
+                        file=payload,
+                        name=self._video_file_name(post_id, idx, total),
+                    ),
+                    timeout=VIDEO_FILE_UPLOAD_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                return f"上传超过 {VIDEO_FILE_UPLOAD_TIMEOUT:.0f} 秒未返回，结果未知"
+            except Exception as e:
+                return f"{e}"
+        return ""
+
+    async def _fallback_video_to_file(self, item: dict[str, Any]) -> None:
+        """视频段被协议端拒收后，把视频改传群文件；覆盖所有推送目标，每个群一次。
+
+        必须一次覆盖**全部**目标群：摘掉视频段后的链会被本轮后续会话复用，后续
+        会话不会再撞一次拒收——只给"第一个拒收的群"传文件，其余群就只能收到正文。
+        结果记在条目上（video_file_sessions / video_file_fail）供面板与记账用；
+        任何失败都不上抛：兜底失败不该把正文一起拖死，正文该照常送达。
+        """
+        if not self._video_file_fallback_enabled():
+            return
+        done = [str(s) for s in (item.get("video_file_sessions") or [])]
+        for session in self._sessions():
+            if session in done:
+                continue
+            err = await self._upload_video_files(session, item)
+            if err:
+                item["video_file_fail"] = err
+                logger.warning(f"微博 {item.get('post_id')} 视频改传群文件失败（{session}）：{err}")
+                continue
+            done.append(session)
+            item["video_file_sessions"] = done
+            item.pop("video_file_fail", None)
+            logger.warning(
+                f"微博 {item.get('post_id')} 视频消息被协议端拒收，已改以群文件发送到 {session}"
+            )
+
+    def _video_file_note(self, item: dict[str, Any]) -> str:
+        """这条链尾该附哪句视频说明：群文件全部传成了就用"已改以群文件发送"。
+
+        推送目标可能有多个群，而链只有一条（所有会话共用）——只有**每个**目标群
+        都传成了才敢说"已以群文件发送"，部分成功时退回保守的"请点原帖链接"，
+        不谎报（哪个群失败在日志与面板里都能看到）。
+        """
+        sent = {str(s) for s in (item.get("video_file_sessions") or [])}
+        targets = set(self._sessions())
+        if sent and targets and targets <= sent:
+            return VIDEO_FILE_SENT_NOTE
+        return VIDEO_FALLBACK_NOTE
+
+    def _video_file_summary(self, item: dict[str, Any]) -> str:
+        """群文件兜底结果的一句话摘要（记账与面板共用）。
+
+        成功了就要说清楚"视频在群文件里拿得到"，别让面板和群里一个说失败一个
+        说成功；失败了也要带原因，否则用户不知道该去查权限还是查协议端。
+        """
+        sent = [str(s) for s in (item.get("video_file_sessions") or [])]
+        if sent:
+            return f"视频已改以群文件发送（{len(sent)} 个群）"
+        err = str(item.get("video_file_fail") or "")
+        if err:
+            return f"群文件兜底也失败：{err}"
+        return ""
 
     def _video_inline_cap_mb(self) -> int:
         """base64 内嵌发送的体积上限（MB），0 表示不限制。

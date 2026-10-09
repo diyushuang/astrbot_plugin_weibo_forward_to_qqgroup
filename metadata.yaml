@@ -2,7 +2,7 @@ name: astrbot_plugin_weibo_forward_to_qqgroup
 display_name: 微博实时转发
 desc: 无需微博 Cookie，实时轮询监控指定微博账号，新微博自动推送到绑定的Q群；微博视频以QQ视频消息直接转发（群里可直接播放，支持图文混排与转发帖视频）；微博图片自动上传到群相册（不同博主可绑定不同相册），推送消息可附带图片；内置 WebUI 控制面板，在 AstrBot 插件详情页查看运行状态、推送统计与最近动态，并可直接增删监控博主、推送目标与相册规则。
 short_desc: 免 Cookie 监控微博更新并实时转发到Q群，视频与图片自动转发，附带 WebUI 控制面板
-version: v1.7.4
+version: v1.7.5
 author: diyushuang
 repo: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 # 上传台账使用 AstrBot KV 存储（v4.9.2 起提供），低于该版本将拒绝加载并明确提示。
