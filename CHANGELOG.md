@@ -415,8 +415,23 @@ v1.7.4 把"协议端拒收富媒体"的现场证据留了下来，这一版解�
 - 指令：`微博绑定` / `微博解绑` / `微博添加` / `微博删除` / `微博列表` / `微博检测` / `微博状态` / `微博帮助`。
 - 基线机制防历史微博刷屏、推送失败重试、账号级指数退避、状态持久化。
 
-<!-- 版本对比链接（发布新版本时请同步打 git tag，如 v1.5.1） -->
+<!-- 版本对比链接（发布新版本时请同步打 git tag，并在此补一行 compare 链接） -->
 
+[1.8.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.6...v1.8.0
+[1.7.6]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.5...v1.7.6
+[1.7.5]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.4...v1.7.5
+[1.7.4]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.3...v1.7.4
+[1.7.3]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.2...v1.7.3
+[1.7.2]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.1...v1.7.2
+[1.7.1]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.0...v1.7.1
+[1.7.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.6.4...v1.7.0
+[1.6.4]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.6.3...v1.6.4
+[1.6.3]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.6.2...v1.6.3
+[1.6.2]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.6.1...v1.6.2
+[1.6.1]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.6.0...v1.6.1
+[1.6.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.5.3...v1.6.0
+[1.5.3]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.5.2...v1.5.3
+[1.5.2]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.4.0...v1.4.1
