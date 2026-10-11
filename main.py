@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.8.0"
+PLUGIN_VERSION = "v1.8.1"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -196,6 +196,14 @@ VIDEO_DL_TIMEOUT = 300.0  # 单个视频下载总超时（秒）：几十上百 
 # 含视频消息的发送超时下限：视频上传 QQ 比九张图还慢，沿用图片的 60s 常常
 # "实际已发出但被判超时"，重试会让群里重复出现同一条视频
 VIDEO_SEND_TIMEOUT_FLOOR = 180
+# 含图片消息的发送超时放大：消息里的图片以 URL 交给协议端自行抓取再走富媒体
+# 上传，NapCat 要把每张图处理完才回回执，多图串行的总耗时随张数线性涨。协议端
+# 富媒体通道劣化时单张十几秒，多图 plog 轻松顶穿 60s——WS 帧早已交出去，群里
+# 实际收到了，插件却按超时记"放弃"（2026-10-10 线上实录：多图帖 60s 超时、群里
+# 可见）。视频有固定下限、图片按张数放大：基础 60s + 每张 20s，九图放大到 240s；
+# 发得快时该返回就返回，放大只抬"等多久才判超时"的上限
+PIC_SEND_TIMEOUT_BASE = 60
+PIC_SEND_TIMEOUT_PER_PIC = 20
 VIDEO_FALLBACK_NOTE = "🎬 视频未能自动转发，请点原帖链接观看"
 VIDEO_PARTIAL_NOTE = "🎬 部分视频未能自动转发，请点原帖链接观看"
 # 视频消息被协议端拒收后改发文件成功时的说明：视频确实进群了（点文件消息即可
@@ -204,6 +212,10 @@ VIDEO_PARTIAL_NOTE = "🎬 部分视频未能自动转发，请点原帖链接�
 # 群里找不到；落进群文件那些部署才用"群文件"那句。
 VIDEO_FILE_TEMP_NOTE = "🎬 视频已改以文件消息发送（临时文件，请及时接收或转存，超时可能失效）"
 VIDEO_FILE_SENT_NOTE = "🎬 视频已改以群文件发送，可在群文件里下载或在线播放"
+# video_prefer_file（配置直选文件，不是被拒收降级）专用的两句："已改以"说的是
+# 半路降级，主动直选文件没有"改"的过程，措辞不撒谎
+VIDEO_FILE_FIRST_TEMP_NOTE = "🎬 视频以文件消息发送（临时文件，请及时接收或转存，超时可能失效）"
+VIDEO_FILE_FIRST_SENT_NOTE = "🎬 视频以群文件发送，可在群文件里下载或在线播放"
 VIDEO_FILE_UPLOAD_TIMEOUT = 180.0  # 文件上传总超时（秒）：几十 MB 的 base64 比发消息还慢
 # 微博视频直链的签名有效窗实测约 3600 秒：留 10 分钟余量，条目里挂过窗的直链
 # 先重取再下载（拿旧链去下必然 403，白烧一轮还把这条视频永久判死）
@@ -2515,6 +2527,28 @@ class WeiboMonitorPlugin(Star):
         except asyncio.TimeoutError as e:
             raise TimeoutError(f"发送超过 {send_timeout} 秒，平台是否已接收未知") from e
 
+    def _send_timeout_for(self, item: dict[str, Any]) -> int:
+        """按这条链实际携带的媒体计算发送超时（秒），0 表示不限制。
+
+        message_send_timeout（60s）是按纯文本消息的经验定的：图片段以 URL 交给
+        协议端自行抓取、视频段更要传完整媒体，协议端把全部媒体处理完才回回执，
+        耗时随媒体量线性涨——一刀切会大量出现"群里已收到、面板判超时放弃"的
+        倒挂。带视频沿用固定下限（视频总比九图慢）；带图按张数放大；两样都带
+        按视频算（下限更高）。
+        """
+        send_timeout = self._int_cfg("message_send_timeout", 60)
+        if not send_timeout:
+            return 0
+        if self._video_carried(item):
+            return max(send_timeout, VIDEO_SEND_TIMEOUT_FLOOR)
+        if self._pics_enabled(item):
+            n = sum(1 for p in (item.get("pics") or []) if str(p.get("url") or ""))
+            if n:
+                send_timeout = max(
+                    send_timeout, PIC_SEND_TIMEOUT_BASE + PIC_SEND_TIMEOUT_PER_PIC * n
+                )
+        return send_timeout
+
     @staticmethod
     def _is_media_rejected(exc: BaseException) -> bool:
         """异常是否为"富媒体被协议端拒收"（QQNT 尺寸/体积风控，NapCatQQ#1443）。
@@ -2620,10 +2654,17 @@ class WeiboMonitorPlugin(Star):
             parts.append("图片段被协议端拒收，已去图改发正文")
         sent = [str(s) for s in (item.get("video_file_sessions") or [])]
         if item.get("video_rejected"):
-            # 视频的去向有两种，措辞要分开：改发文件成了（视频还在群里拿得到，
-            # 临时文件还是群文件见 _video_file_summary）或只剩一句提示链接——
-            # 不然面板会同时出现"已去掉视频"和"已发送"两句，读起来自相矛盾
-            parts.append("视频段被协议端拒收，" + (self._video_file_summary(item) or "已去掉视频"))
+            if item.get("video_file_first"):
+                # video_prefer_file 是配置直选文件，不是被拒收：措辞不提"拒收"，
+                # 否则面板会把用户的主动选择报成"协议端有问题"
+                parts.append(self._video_file_summary(item) or "视频未随消息发送")
+            else:
+                # 视频的去向有两种，措辞要分开：改发文件成了（视频还在群里拿得到，
+                # 临时文件还是群文件见 _video_file_summary）或只剩一句提示链接——
+                # 不然面板会同时出现"已去掉视频"和"已发送"两句，读起来自相矛盾
+                parts.append(
+                    "视频段被协议端拒收，" + (self._video_file_summary(item) or "已去掉视频")
+                )
         if not sent:
             err = str(item.get("video_file_fail") or "")
             if err:
@@ -2992,10 +3033,22 @@ class WeiboMonitorPlugin(Star):
                     continue
                 sent_sessions: list[str] = []
                 timed_out_sessions: list[str] = []
+                if (
+                    self._video_prefer_file()
+                    and self._video_file_fallback_enabled()
+                    and self._video_carried(item)
+                ):
+                    # 文件优先（video_prefer_file）：视频消息这条路在 rich media
+                    # transfer failed 常态化的协议端上每条都要白撞一次拒收，配置
+                    # 直选文件就跳过它，先走文件服务把视频送进全部目标群，正文按
+                    # "已去视频"的链发送。video_rejected 让链构建、超时计算与
+                    # 拒收降级同路；video_file_first 留证措辞用——是配置直选，
+                    # 不是被拒收，面板与记账不能写成"协议端拒收"
+                    item["video_file_first"] = True
+                    item["video_rejected"] = True
+                    await self._fallback_video_to_file(item)
                 chain = await self._build_chain(item)
-                send_timeout = self._int_cfg("message_send_timeout", 60)
-                if send_timeout and self._video_carried(item):
-                    send_timeout = max(send_timeout, VIDEO_SEND_TIMEOUT_FLOOR)
+                send_timeout = self._send_timeout_for(item)
                 self._mark_sending(item)
                 # 打上"正在发送"标记：面板此刻点取消不能直接把条目搬走（发送协程
                 # 还在用它、还在往群里发），只能打 _cancel_requested，由下面收尾
@@ -3113,7 +3166,9 @@ class WeiboMonitorPlugin(Star):
             return delivered, unknown
         for session in sessions:
             try:
-                if await self._send_with_timeout(session, chain):
+                if await self._send_with_timeout(
+                    session, chain, timeout_seconds=self._send_timeout_for(item)
+                ):
                     delivered.append(session)
                     logger.info(
                         f"微博 {item['post_id']} 视频段多次发送失败，已去视频降级重发到 {session}"
@@ -3153,6 +3208,18 @@ class WeiboMonitorPlugin(Star):
 
     def _video_file_fallback_enabled(self) -> bool:
         return bool(self.config.get("video_file_fallback", True))
+
+    def _video_prefer_file(self) -> bool:
+        """视频是否跳过 QQ 视频消息、直接以文件发送（video_prefer_file，默认开）。
+
+        默认开：本插件面对的部署现场里富媒体通道对视频消息并不可靠——4~5MB
+        的小视频也稳定回 `rich media transfer failed`（NapCat 版本回归、账号
+        风控都可能），每条视频都要白撞一次拒收才轮到文件兜底，不如发送前直接
+        走文件服务（落点由 video_file_temp 决定）。依赖 video_file_fallback
+        开启——关着文件兜底就没有可走的路，本项不生效，仍按视频消息发送。
+        富媒体通道可靠、想要"点开就播"视频消息的部署把本项关掉。
+        """
+        return bool(self.config.get("video_prefer_file", True))
 
     def _video_file_temp(self) -> bool:
         """兜底上传是否走"临时（在线）文件"而不是落进群文件永久空间。
@@ -3293,6 +3360,13 @@ class WeiboMonitorPlugin(Star):
         sent = {str(s) for s in (item.get("video_file_sessions") or [])}
         targets = set(self._sessions())
         if sent and targets and targets <= sent:
+            if item.get("video_file_first"):
+                # 配置直选文件：没有"改以"的过程，措辞与拒收降级分开
+                return (
+                    VIDEO_FILE_FIRST_TEMP_NOTE
+                    if self._video_file_temp()
+                    else VIDEO_FILE_FIRST_SENT_NOTE
+                )
             return VIDEO_FILE_TEMP_NOTE if self._video_file_temp() else VIDEO_FILE_SENT_NOTE
         return VIDEO_FALLBACK_NOTE
 
@@ -3306,7 +3380,8 @@ class WeiboMonitorPlugin(Star):
         sent = [str(s) for s in (item.get("video_file_sessions") or [])]
         if sent:
             kind = "临时文件" if self._video_file_temp() else "群文件"
-            return f"视频已改以{kind}发送（{len(sent)} 个群）"
+            head = "视频以" if item.get("video_file_first") else "视频已改以"
+            return f"{head}{kind}发送（{len(sent)} 个群）"
         err = str(item.get("video_file_fail") or "")
         if err:
             return f"文件兜底也失败：{err}"

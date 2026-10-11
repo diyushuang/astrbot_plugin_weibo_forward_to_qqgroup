@@ -5,6 +5,27 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [1.8.1] - 2026-10-11
+
+线上两件事挤在这一版：一是协议端对**小体积视频也稳定拒收**（10-09 那条 5.6MB、10-10 又一条 4.5MB，都远低于 100MB 硬限——富媒体通道是坏的，不是素材超限），每条视频都得先白撞一次拒收才轮到文件兜底；二是 10-10 一条多图 plog 按默认 60s 判了发送超时、面板记「推送放弃」，**群里实际却收到了**——消息链早就交给协议端，它慢慢传完才把消息进群，回执没赶上 60s。
+
+### 新增
+
+- **`video_prefer_file`（bool，默认 true）：视频默认直接以文件消息发送，跳过 QQ 视频消息**。富媒体通道对视频消息并不可靠的现场（4~5MB 的小视频也回 `rich media transfer failed`——NapCat 版本回归、账号风控都可能）里，视频消息这条路每条都要白撞一次拒收再降级，默认就跳过它：发送前直接走文件服务把视频送进**全部**目标群（复用文件兜底通道，落点由 `video_file_temp` 决定）。依赖 `video_file_fallback` 开启，关闭时本项不生效、仍按视频消息发送。群里说明与面板记账写「视频以临时文件发送」，与拒收降级的「已改以」措辞分开——是配置使然，不是协议端出问题。**富媒体通道可靠、想要"点开就播"的视频消息**：关掉本项即可回到视频消息形态。
+
+### 修复
+
+- **带图消息的发送超时按张数放大**：`message_send_timeout`（60s）是纯文本时代的经验值，图片段以 URL 交给协议端自行抓取再走富媒体上传，回执要等全部图处理完才回，多图串行轻松顶穿 60s——WS 帧早已交出去，群里实际收到，插件却按超时记「推送放弃…结果未知」（防重复不重发的决策本身是对的，但记账倒挂）。现在带视频沿用 180s 下限，带图按 `60s + 20s/张` 放大（九图 240s），两样都带按视频算；`message_send_timeout=0`（不限制）不受影响。发得快时该返回就返回，放大只抬"等多久才判超时"的上限。重试超限的最后降级补发同样按此计算。
+
+### 变更
+
+- 带视频条目的发送超时计算收拢进 `_send_timeout_for(item)`，与图片放大共用一套口径。
+
+### 测试
+
+- 新增 `bench/_test_v181_filefirst.py`（**44 项**）：文件优先（上传参数/全部目标群覆盖/链不带视频段/群内说明与记账措辞不提"拒收"/失败不拖死正文/`video_file_fallback` 关闭时不生效/重复轮次不重复上传）、未配置默认文件优先、显式关掉回到视频消息形态、发送超时计算（视频下限/图片按张数/被摘段后回默认/0 不限制）、配置表默认值与 hint 依赖说明、版本号三处同步。
+- `bench/test_dashboard_api.py`：FakePlugin 的 `_video_file_summary` / `_reject_reason` 复刻同步 `video_file_first` 措辞分支；`bench/_test_rich_media_ladder.py` 的"摘掉视频段后回落 60s"断言同步到按剩余图片放大的新口径（1 张 → 80s）。测"视频消息路径"的既有 harness（文件兜底 / 降级链 / v1.6.2 健壮性 / 取消推送 / bench_upload / 两个 repro 脚本）显式钉住 `video_prefer_file: false`——它们测的正是关掉本项后的那条路。
+
 ## [1.8.0] - 2026-10-09
 
 推送一直失败时，面板原本没有任何"就到此为止"的手段：一条发不出去的微博要按 `max_pending_retries`（默认 5 轮）× 轮询间隔反复重试，最长十几分钟；期间后面排队的微博全被它堵着，而集群里那条就是不要了也没法说。这一版把两个人工出口做进面板，并把"取消之后到底会发生什么"逐条写进文档。同时按既定规范重整了仓库文档。
@@ -417,6 +438,7 @@ v1.7.4 把"协议端拒收富媒体"的现场证据留了下来，这一版解�
 
 <!-- 版本对比链接（发布新版本时请同步打 git tag，并在此补一行 compare 链接） -->
 
+[1.8.1]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.6...v1.8.0
 [1.7.6]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.5...v1.7.6
 [1.7.5]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.4...v1.7.5
