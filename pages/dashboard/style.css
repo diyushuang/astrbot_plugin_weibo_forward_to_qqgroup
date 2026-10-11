@@ -287,6 +287,23 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 .badge.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
 .badge.err { color: var(--err); border-color: var(--err); background: var(--err-bg); }
+.badge.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+
+/* 推送预览：开关标记一行、样例消息用等宽块展示（pre-wrap 保留模板换行） */
+.preview-badges { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.preview-badges .preview-kw { font-size: 12px; color: var(--text-dim); }
+.preview-text {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg, transparent);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 .btn-mini {
   appearance: none;

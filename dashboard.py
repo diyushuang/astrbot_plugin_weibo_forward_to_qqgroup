@@ -89,6 +89,12 @@ def register_dashboard(
     routes = (
         (f"/{plugin_name}/overview", api.overview, ["GET"], "微博转发面板总览"),
         (f"/{plugin_name}/errors", api.errors, ["GET"], "错误日志留存"),
+        (
+            f"/{plugin_name}/preview-push",
+            api.preview_push,
+            ["GET"],
+            "推送预览（按当前配置渲染样例）",
+        ),
         (f"/{plugin_name}/check-now", api.check_now, ["POST"], "立即检查一轮"),
         (f"/{plugin_name}/cancel-pending", api.cancel_pending, ["POST"], "取消一条待推送微博"),
         (
@@ -305,6 +311,13 @@ class DashboardAPI:
         cleared = await self.p.clear_error_log()
         self._log.info(f"面板清空错误留存 {cleared} 条")
         return json_response({"cleared": cleared})
+
+    async def preview_push(self):
+        """按当前配置渲染一条样例推送（样例是虚构的，不发消息、不进队列）。"""
+        try:
+            return json_response(self.p.preview_push())
+        except Exception as e:
+            return error_response(f"推送预览生成失败: {e!r}", 500)
 
     # ---------------- 操作 ----------------
 

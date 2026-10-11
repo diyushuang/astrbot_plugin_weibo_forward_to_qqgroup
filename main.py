@@ -28,7 +28,7 @@ from urllib.parse import quote, urlparse, urlunparse
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Video
+from astrbot.api.message_components import AtAll, Image, Video
 from astrbot.api.star import Context, Star, StarTools
 
 try:
@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.8.1"
+PLUGIN_VERSION = "v1.9.0"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -446,6 +446,160 @@ def to_light(url: str) -> str:
     if not m:
         return url
     return f"https://{m.group(2)}.sinaimg.cn/mw2000/{m.group(4)}.{m.group(5)}"
+
+
+# ---------------- 微博正文润色（表情翻译 / 话题标签） ----------------
+
+# 微博表情码 -> emoji 映射（内置高频子集）：键是方括号表情码去掉方括号的名字。
+# [doge] 这类没有严格对应 emoji 的按社群惯用近似映射；映射表里没有的码原样
+# 保留，正文里普通方括号文字（不属于任何已知表情码）不受影响。
+WEIBO_EMOJI_MAP: dict[str, str] = {
+    "嘻嘻": "😄",
+    "哈哈": "😆",
+    "笑cry": "🤣",
+    "doge": "🐶",
+    "二哈": "🐕",
+    "太开心": "🥳",
+    "微笑": "🙂",
+    "可爱": "😊",
+    "乖": "😌",
+    "偷笑": "🤭",
+    "偷乐": "😏",
+    "色": "😍",
+    "花痴": "😍",
+    "害羞": "😳",
+    "羞嗒嗒": "😳",
+    "得意": "😎",
+    "酷": "😎",
+    "憧憬": "🤩",
+    "惊喜": "🤩",
+    "围观": "👀",
+    "偷看": "👀",
+    "亲亲": "😘",
+    "亲吻": "😘",
+    "抱抱": "🤗",
+    "可怜": "🥺",
+    "委屈": "🥹",
+    "悲伤": "😢",
+    "泪": "😢",
+    "大哭": "😭",
+    "允悲": "😭",
+    "心": "❤️",
+    "心碎": "💔",
+    "赞": "👍",
+    "good": "👍",
+    "weak": "👎",
+    "给力": "💪",
+    "加油": "💪",
+    "威武": "💪",
+    "拳头": "✊",
+    "OK": "👌",
+    "ok": "👌",
+    "胜利": "✌️",
+    "耶": "✌️",
+    "鼓掌": "👏",
+    "抱拳": "🤝",
+    "怒": "😠",
+    "怒骂": "🤬",
+    "生气": "😤",
+    "哼": "😤",
+    "汗": "😅",
+    "黑线": "😑",
+    "无语": "🙄",
+    "白眼": "🙄",
+    "翻白眼": "🙄",
+    "晕": "😵",
+    "抓狂": "🤯",
+    "崩溃": "😫",
+    "裂开": "😖",
+    "捂脸": "🤦",
+    "打脸": "🤦",
+    "睡觉": "😴",
+    "困": "🥱",
+    "打哈欠": "🥱",
+    "生病": "🤒",
+    "感冒": "🤧",
+    "咳嗽": "😷",
+    "口罩": "😷",
+    "惊讶": "😮",
+    "吃惊": "😲",
+    "呆": "😐",
+    "疑问": "🤔",
+    "思考": "🤔",
+    "若有所思": "🤔",
+    "并不简单": "🧐",
+    "嘘": "🤫",
+    "闭嘴": "🤐",
+    "馋嘴": "😋",
+    "吃瓜": "🍉",
+    "柠檬": "🍋",
+    "酸": "🍋",
+    "咖啡": "☕",
+    "蛋糕": "🍰",
+    "礼物": "🎁",
+    "钟": "⏰",
+    "月亮": "🌙",
+    "太阳": "☀️",
+    "下雨": "🌧️",
+    "彩虹": "🌈",
+    "烟花": "🎆",
+    "钱": "💰",
+    "蜡烛": "🕯️",
+    "草泥马": "🦙",
+    "兔子": "🐰",
+    "熊猫": "🐼",
+    "猪": "🐷",
+    "猫猫": "🐱",
+    "喵喵": "🐱",
+    "话筒": "🎤",
+    "音乐": "🎵",
+    "照相机": "📷",
+    "手机": "📱",
+    "电脑": "💻",
+    "灯泡": "💡",
+    "浮云": "☁️",
+    "鲜花": "💐",
+    "微风": "🍃",
+    "叶子": "🍃",
+    "爱心传递": "💗",
+    "好运": "🍀",
+    "足球": "⚽",
+    "篮球": "🏀",
+    "乒乓": "🏓",
+    "游泳": "🏊",
+    "跑步": "🏃",
+    "庆祝": "🎉",
+    "hooray": "🎉",
+    "no": "🙅",
+}
+
+_WEIBO_EMOJI_RE = re.compile(r"\[([^\[\]\n]{1,10})\]")
+
+# 微博话题：两端 # 包住话题名（内不含 # 与换行，可含空格），非贪婪取最短。
+_WEIBO_HASHTAG_RE = re.compile(r"#([^#\n]{1,50}?)#")
+
+
+def translate_weibo_emojis(text: str) -> str:
+    """把正文里的微博表情码（[笑cry][doge]）替换成 emoji，认识的才换。"""
+    if not text:
+        return text
+
+    def _sub(m: re.Match) -> str:
+        return WEIBO_EMOJI_MAP.get(m.group(1), m.group(0))
+
+    return _WEIBO_EMOJI_RE.sub(_sub, text)
+
+
+def extract_hashtags(raw: str, limit: int = 10) -> list[str]:
+    """从微博正文提取 #话题#，按出现顺序去重（正文被截断时可能取不全）。"""
+    tags: list[str] = []
+    for m in _WEIBO_HASHTAG_RE.finditer(raw or ""):
+        tag = m.group(1).strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+            if len(tags) >= limit:
+                break
+    return tags
 
 
 def _pic_nodes(mb: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2246,14 +2400,18 @@ class WeiboMonitorPlugin(Star):
 
     def _post_body(self, post: dict[str, Any]) -> str:
         """模板 {weibo} 占位符的正文内容。"""
+        translate = bool(self.config.get("weibo_emoji_translate", False))
         if post["is_retweet"]:
             parts: list[str] = []
             if post["text"]:
                 parts.append(post["text"])
             who = post["orig_name"] or "原作者"
-            parts.append(f"转发 @{who}：{post['orig_text'] or '（原微博内容不可见）'}")
-            return "\n".join(parts)
-        return post["text"] or ""
+            orig = post["orig_text"] or "（原微博内容不可见）"
+            parts.append(f"转发 @{who}：{orig}")
+            body = "\n".join(parts)
+        else:
+            body = post["text"] or ""
+        return translate_weibo_emojis(body) if translate else body
 
     def _keyword_hit(self, post: dict[str, Any]) -> str | None:
         """关键词过滤：命中屏蔽词或被白名单排除时返回原因，否则 None。"""
@@ -2278,7 +2436,44 @@ class WeiboMonitorPlugin(Star):
             .replace("{weibo}", self._post_body(post))
             .replace("{link}", post["link"])
         )
+        if bool(self.config.get("show_hashtags", False)):
+            # 话题标签行：与关键词过滤同口径（正文+转发原文），追加在消息末尾
+            tags = extract_hashtags(f"{post['text']}\n{post['orig_text']}")
+            if tags:
+                msg += "\n" + " ".join(f"#{t}#" for t in tags)
         return re.sub(r"\n{3,}", "\n\n", msg).strip()
+
+    # ---------------- 面板推送预览 ----------------
+
+    def preview_push(self) -> dict[str, Any]:
+        """按当前配置渲染一条样例推送，供面板「推送预览」卡片展示。
+
+        样例微博是虚构的：不进已见记录、不进待推送队列、不给任何会话发消息，
+        但渲染路径与真实推送完全一致（_build_message），模板、话题标签行、
+        表情翻译都按当前配置生效。@全体成员只给「会不会带上」的判定——机器人
+        在目标群有没有管理员权限要到协议端发送时才知道。
+        """
+        sample_text = "今天上新啦～[笑cry]转发抽三位宝送周边 #上新抽奖# #粉丝福利#"
+        sample = {
+            "id": "preview",
+            "uid": "1234567890",
+            "author": "样例博主",
+            "time": "10-11 12:30",
+            "text": sample_text,
+            "orig_name": "",
+            "orig_text": "",
+            "is_retweet": False,
+            "link": "https://weibo.com/1234567890/example",
+        }
+        kws = [str(k).strip() for k in (self.config.get("at_all_keywords") or []) if str(k).strip()]
+        return {
+            "text": self._build_message(sample),
+            "at_all": self._at_all_hit({"raw_text": sample_text}),
+            "at_all_on": bool(self.config.get("at_all", False)),
+            "at_all_keywords": kws,
+            "with_images": bool(self.config.get("message_with_images", True)),
+            "with_videos": self._videos_enabled(),
+        }
 
     # ---------------- 轮询与推送 ----------------
 
@@ -2683,6 +2878,33 @@ class WeiboMonitorPlugin(Star):
         head = "，".join(parts)
         return f"{head}；{extra}" if head else extra
 
+    def _at_all_hit(self, item: dict[str, Any]) -> bool:
+        """这条推送是否满足 @全体条件：总开关开、且关键词限定为空或命中。
+
+        匹配范围与屏蔽词一致（条目上的 raw_text：正文+转发原文），与模板渲染
+        无关——用户改模板也不影响判定，误把「微博」这类模板头部的词填进关键词
+        也不会让每条推送都命中。
+        """
+        if not bool(self.config.get("at_all", False)):
+            return False
+        kws = [str(k).strip() for k in (self.config.get("at_all_keywords") or []) if str(k).strip()]
+        if not kws:
+            return True
+        text = str(item.get("raw_text") or "")
+        return any(kw in text for kw in kws)
+
+    def _with_at_all(self, session: str, item: dict[str, Any], chain: MessageChain) -> MessageChain:
+        """群聊且满足条件时返回链首带 AtAll 的消息链，否则原链返回。
+
+        每次发送前按会话现做：消息链在多个会话间复用（含拒收摘段后的重建链），
+        而 @全体只该进群聊、私聊会话不能被动沾上；包装生成新链对象，不改原链。
+        """
+        if not self._at_all_hit(item):
+            return chain
+        if self._parse_umo(session)[1] != "GroupMessage":
+            return chain
+        return MessageChain(chain=[AtAll(), *chain.chain])
+
     async def _send_rich_media(
         self,
         session: str,
@@ -2696,10 +2918,23 @@ class WeiboMonitorPlugin(Star):
         （超时，结果未知，不重发以防群里重复）/ "failed"（确定没送达）。
         摘段补发能立刻做是因为协议端明确回了失败、消息确定没进群；返回的链给调用方
         复用，本轮后续会话不必再拿同一条注定被拒的链各撞一次。
+        @全体成员在发送环节按会话包装进链首（_with_at_all）：群聊且满足条件才带，
+        发送失败时去掉 @全体补发一次正文，不让机器人权限这类问题拖死整条推送。
         """
+        at_all_skipped = False
         while True:
+            send_chain = chain
+            at_all_wrapped = False
             try:
-                if await self._send_with_timeout(session, chain, timeout_seconds=timeout_seconds):
+                if not at_all_skipped:
+                    wrapped = self._with_at_all(session, item, chain)
+                    if wrapped is not chain:
+                        send_chain = wrapped
+                        at_all_wrapped = True
+                ok = await self._send_with_timeout(
+                    session, send_chain, timeout_seconds=timeout_seconds
+                )
+                if ok:
                     return "sent", chain
                 return "failed", chain
             except asyncio.CancelledError:
@@ -2709,6 +2944,17 @@ class WeiboMonitorPlugin(Star):
             except Exception as e:
                 seg = self._strip_rejected_segment(item) if self._is_media_rejected(e) else ""
                 if not seg:
+                    if at_all_wrapped and not at_all_skipped:
+                        # @全体发不出去（机器人不是群管理员、撞了 QQ 每日 @全体
+                        # 频次限制等）：去掉 AtAll 补发一次，正文保底出群。只
+                        # 影响本会话本次尝试，不落任何标记——其它群/下一轮还会
+                        # 按配置再试 @全体
+                        at_all_skipped = True
+                        logger.warning(
+                            f"推送到 {session} 失败: {e!r}；@全体成员未送出，"
+                            f"去掉 @全体补发微博 {item['post_id']} 的正文"
+                        )
+                        continue
                     logger.warning(f"推送到 {session} 失败: {e!r}")
                     return "failed", chain
                 # 回执与体量一并留下：这条日志（错误留存面板）是现场唯一的证据，
@@ -2948,9 +3194,15 @@ class WeiboMonitorPlugin(Star):
         · 单条取消：条目在条目边界被搬进"可撤销保留区"；正在发送的条目要等它
           的会话循环收尾（取消时已经发出去的会话收不回来，按真实结果记账）；
         · 停止本轮：循环在条目之间收尾，剩余条目原样留队，不消耗重试次数。
+
+        max_push_per_round（0 不限）限制的是本轮真正发送出去的条数：博主密集
+        发博或翻页补漏积压时防刷屏、降低触发 QQ 风控的概率。取消/过期/重试
+        超限的善后与视频预下载都不占配额——只挡"新发送"，不挡队列治理。
         """
         max_retries = self._int_cfg("max_pending_retries", 5)
         delay = self._int_cfg("push_delay_seconds", 2)
+        max_push = self._int_cfg("max_push_per_round", 0)
+        pushed_this_round = 0
         sessions = self._sessions()
         # 快照：循环中会从 self.pending 移除已完成条目。面板取消的条目同样会从
         # self.pending 消失，这里靠 _cancel_done / _cancel_requested 两个标记认出
@@ -3023,6 +3275,8 @@ class WeiboMonitorPlugin(Star):
                         )
                     if delivered or unknown:
                         self._dispatch_album_uploads(item, delivered + unknown)
+                        # 降级补发同样是真实出群的消息：计入本轮推送配额
+                        pushed_this_round += 1
                     self._pending_discard(item)
                     changed = True
                     continue
@@ -3031,6 +3285,14 @@ class WeiboMonitorPlugin(Star):
                     # 下载不是失败，烧完重试配额会把已经下好的视频一起弄丢
                     self._ensure_video_prepare(item)
                     continue
+                if max_push > 0 and pushed_this_round >= max_push:
+                    # 单轮推送上限：放在视频就绪检查之后——预下载不占配额照常
+                    # 进行，只挡真正的发送；剩余条目原样留队，不消耗重试次数
+                    logger.info(
+                        f"本轮已推送 {pushed_this_round} 条，达到 max_push_per_round"
+                        f"（{max_push}）上限，剩余 {total - idx} 条留待下一轮"
+                    )
+                    break
                 sent_sessions: list[str] = []
                 timed_out_sessions: list[str] = []
                 if (
@@ -3089,6 +3351,7 @@ class WeiboMonitorPlugin(Star):
                     item["_cancel_done"] = True
                 if sent_sessions:
                     self._pending_discard(item)
+                    pushed_this_round += 1
                     logger.info(f"已推送微博 {item['post_id']}")
                     # 摘段标记可能来自本轮的补发，也可能来自更早的轮次（摘段后
                     # 下一轮才发出去），记账口径一致
@@ -3115,6 +3378,9 @@ class WeiboMonitorPlugin(Star):
                         last_save = now_mono
                 elif timed_out_sessions:
                     self._pending_discard(item)
+                    # 结果未知多半是实际已送达：按占用了发送配额计，防大载荷
+                    # 超时后本轮又源源不断发出后续条目
+                    pushed_this_round += 1
                     self._record_push(
                         str(item.get("uid") or ""),
                         False,

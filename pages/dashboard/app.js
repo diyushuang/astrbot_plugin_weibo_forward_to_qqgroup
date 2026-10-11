@@ -652,6 +652,7 @@ async function load() {
     setStatus(`加载失败：${e && e.message ? e.message : e}`, "error");
   }
   await loadErrors();
+  await loadPreview();
 }
 
 async function loadErrors() {
@@ -661,6 +662,36 @@ async function loadErrors() {
   } catch (e) {
     // 错误留存读取失败不打断面板其它区块
   }
+}
+
+async function loadPreview() {
+  try {
+    const data = await window.__bridge.apiGet("preview-push");
+    renderPreview(data);
+  } catch (e) {
+    // 预览读取失败不打断面板其它区块，就地写明原因
+    const box = els["preview-text"];
+    if (box) box.textContent = `（预览读取失败：${e && e.message ? e.message : e}）`;
+  }
+}
+
+function renderPreview(data) {
+  const badges = els["preview-badges"];
+  badges.replaceChildren();
+  if (!data.at_all_on) {
+    badges.append(el("span", "badge", "@全体成员 关"));
+  } else if (data.at_all) {
+    badges.append(el("span", "badge ok", "@全体成员 会带上"));
+  } else {
+    badges.append(el("span", "badge warn", "@全体成员 受关键词限定 · 本样例未命中"));
+  }
+  badges.append(el("span", "badge", data.with_images ? "推送带图 开" : "推送带图 关"));
+  badges.append(el("span", "badge", data.with_videos ? "推送带视频 开" : "推送带视频 关"));
+  const kws = data.at_all_keywords || [];
+  if (data.at_all_on && kws.length) {
+    badges.append(el("span", "preview-kw", `@全体关键词：${kws.join("、")}`));
+  }
+  els["preview-text"].textContent = data.text || "（空）";
 }
 
 async function act(btn, endpoint, body, onOk) {
@@ -755,6 +786,9 @@ function wireForms() {
   });
 
   els["btn-refresh"].addEventListener("click", () => load());
+
+  // 推送预览随 load() 一起刷新；改完配置后可单独点「刷新预览」
+  els["btn-preview-refresh"].addEventListener("click", () => loadPreview());
 
   // 「停止本轮推送」不走 act()：act 末尾的 busy(btn, false) 会与 renderStatus
   // 里按 push_round_active 计算的置灰状态打架，这里按「立即检查」的做法手写
