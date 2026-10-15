@@ -111,6 +111,12 @@ def register_dashboard(
         ),
         (f"/{plugin_name}/clear-errors", api.clear_errors, ["POST"], "清空错误留存"),
         (f"/{plugin_name}/accounts", api.accounts, ["POST"], "增删监控博主"),
+        (
+            f"/{plugin_name}/at-all-uids",
+            api.at_all_uids,
+            ["POST"],
+            "增删 @全体 博主名单",
+        ),
         (f"/{plugin_name}/sessions", api.sessions, ["POST"], "增删推送目标"),
         (f"/{plugin_name}/album-rules", api.album_rules, ["POST"], "增删相册规则"),
         (
@@ -171,6 +177,7 @@ class DashboardAPI:
 
         accounts = []
         by_uid = p.stats.get("by_uid") or {}
+        at_all_uids = set(p._at_all_uids())
         for uid, info in p.accounts.items():
             accounts.append(
                 {
@@ -181,6 +188,7 @@ class DashboardAPI:
                     "fail_count": int(info.get("fail_count") or 0),
                     "next_retry_ts": float(info.get("next_retry_ts") or 0),
                     "push_ok": int((by_uid.get(uid) or {}).get("push_ok") or 0),
+                    "at_all": uid in at_all_uids,
                 }
             )
 
@@ -276,6 +284,9 @@ class DashboardAPI:
                     "proxy": self._redact_proxy(p._proxy) if p._proxy else "",
                     "ffmpeg": bool(p._ffmpeg),
                     "album_enabled": bool(p.config.get("album_enabled", True)),
+                    # 博主行的 @全体 开关只在总开关打开时才真正生效，面板要能说明
+                    "at_all": bool(p.config.get("at_all", False)),
+                    "at_all_uid_count": len(at_all_uids),
                     # 在途后台任务：非零且有错误时配合错误日志定位卡在哪一步
                     "bg_tasks": {
                         "video_download": len(p._video_tasks),
@@ -430,6 +441,38 @@ class DashboardAPI:
             p._record_event("info", uid=uid, name=name, detail="通过面板取消监控")
             return json_response({"removed": uid, "name": name})
         return error_response("不支持的操作")
+
+    async def at_all_uids(self):
+        p = self.p
+        body = await self._body()
+        action = str(body.get("action") or "")
+        uid = self._extract_uid(str(body.get("uid") or "")) or ""
+        if not uid:
+            return error_response("请输入有效的微博 uid 或主页链接")
+        p._sync_accounts_from_config()
+        if uid not in p.accounts:
+            return error_response(f"账号 {uid} 不在监控列表中，请先添加监控")
+        current = p._at_all_uids()
+        if action == "add":
+            if uid in current:
+                return error_response(f"账号 {uid} 已在 @全体名单中")
+            p.config["at_all_uids"] = [*current, uid]
+        elif action == "remove":
+            if uid not in current:
+                return error_response(f"账号 {uid} 不在 @全体名单中")
+            p.config["at_all_uids"] = [u for u in current if u != uid]
+        else:
+            return error_response("不支持的操作")
+        p._save_config()
+        name = p._account_name(uid)
+        on = action == "add"
+        p._record_event(
+            "info",
+            uid=uid,
+            name=name,
+            detail="通过面板加入 @全体名单" if on else "通过面板移出 @全体名单",
+        )
+        return json_response({"uid": uid, "name": name, "at_all": on})
 
     async def sessions(self):
         p = self.p

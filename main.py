@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.9.0"
+PLUGIN_VERSION = "v1.10.0"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -2454,23 +2454,28 @@ class WeiboMonitorPlugin(Star):
         在目标群有没有管理员权限要到协议端发送时才知道。
         """
         sample_text = "今天上新啦～[笑cry]转发抽三位宝送周边 #上新抽奖# #粉丝福利#"
+        # 样例博主跟着名单走：填了 at_all_uids 就按名单首位博主渲染，否则固定
+        # uid 永远落在名单外，预览只会反复说「本样例未命中」，看不出配置效果。
+        uids = self._at_all_uids()
+        sample_uid = uids[0] if uids else "1234567890"
         sample = {
             "id": "preview",
-            "uid": "1234567890",
-            "author": "样例博主",
+            "uid": sample_uid,
+            "author": self._account_name(sample_uid) if uids else "样例博主",
             "time": "10-11 12:30",
             "text": sample_text,
             "orig_name": "",
             "orig_text": "",
             "is_retweet": False,
-            "link": "https://weibo.com/1234567890/example",
+            "link": f"https://weibo.com/{sample_uid}/example",
         }
         kws = [str(k).strip() for k in (self.config.get("at_all_keywords") or []) if str(k).strip()]
         return {
             "text": self._build_message(sample),
-            "at_all": self._at_all_hit({"raw_text": sample_text}),
+            "at_all": self._at_all_hit({"raw_text": sample_text, "uid": sample_uid}),
             "at_all_on": bool(self.config.get("at_all", False)),
             "at_all_keywords": kws,
+            "at_all_uids": [self._account_name(u) for u in uids],
             "with_images": bool(self.config.get("message_with_images", True)),
             "with_videos": self._videos_enabled(),
         }
@@ -2878,14 +2883,28 @@ class WeiboMonitorPlugin(Star):
         head = "，".join(parts)
         return f"{head}；{extra}" if head else extra
 
-    def _at_all_hit(self, item: dict[str, Any]) -> bool:
-        """这条推送是否满足 @全体条件：总开关开、且关键词限定为空或命中。
+    def _at_all_uids(self) -> list[str]:
+        """@全体博主名单（去空白、保序去重）；空列表 = 不限博主。"""
+        uids: list[str] = []
+        for item in self.config.get("at_all_uids") or []:
+            uid = str(item).strip()
+            if uid and uid not in uids:
+                uids.append(uid)
+        return uids
 
+    def _at_all_hit(self, item: dict[str, Any]) -> bool:
+        """这条推送是否满足 @全体条件：总开关开、博主在名单内、且关键词命中。
+
+        博主名单与关键词是两道各自独立的闸门，都要过：名单留空 = 不限博主，
+        关键词留空 = 不限内容（判定口径不变，向后兼容只开关键词的用法）。
         匹配范围与屏蔽词一致（条目上的 raw_text：正文+转发原文），与模板渲染
         无关——用户改模板也不影响判定，误把「微博」这类模板头部的词填进关键词
         也不会让每条推送都命中。
         """
         if not bool(self.config.get("at_all", False)):
+            return False
+        uids = self._at_all_uids()
+        if uids and str(item.get("uid") or "") not in uids:
             return False
         kws = [str(k).strip() for k in (self.config.get("at_all_keywords") or []) if str(k).strip()]
         if not kws:

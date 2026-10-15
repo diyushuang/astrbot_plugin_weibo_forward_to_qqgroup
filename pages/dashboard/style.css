@@ -319,6 +319,13 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 .btn-mini:hover { color: var(--err); background: var(--err-bg); }
 
+/* 博主行的 @全体 开关：点亮表示该博主在名单内，用绿色标记，
+   不套用「移除」那套红色 hover——它是开关，不是删除 */
+.btn-mini.btn-at { border: 1px solid var(--border); }
+.btn-mini.btn-at:hover { color: var(--accent); background: var(--bg); }
+.btn-mini.btn-at.on { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.btn-mini.btn-at.on:hover { color: var(--ok); background: var(--ok-bg); }
+
 .rule-form {
   display: grid;
   grid-template-columns: 1.2fr 1fr 1.2fr auto;

@@ -37,6 +37,8 @@
       </form>
       <ul class="list" id="account-list"></ul>
       <p class="empty" id="accounts-empty">尚未监控任何账号。添加后下一轮检查会先建立基线，历史微博不会推送。</p>
+      <p class="hint">点博主行的「@全体」可让该博主的新微博推送时 @全体成员（需机器人在群里是管理员，且插件配置 at_all 总开关开启）；不 @ 的博主保持普通推送。</p>
+      <p class="hint" id="at-all-tip" hidden>已勾选 @全体 的博主名单已保存，但插件配置的 @全体成员总开关（at_all）当前为关闭，开启后即生效。</p>
     </section>
 
     <section class="card">
@@ -94,7 +96,7 @@
     </h2>
     <div class="preview-badges" id="preview-badges"></div>
     <pre class="preview-text" id="preview-text"></pre>
-    <p class="hint">按当前插件配置渲染的一条样例（虚构微博，不会真的发送）：消息模板、话题标签行与表情翻译即时生效，图片/视频段与 @全体成员是否带上见上方标记。在插件配置面板改完配置后点「刷新预览」即可看到群里将收到的效果。</p>
+    <p class="hint">按当前插件配置渲染的一条样例（虚构微博，不会真的发送）：消息模板、话题标签行与表情翻译即时生效，图片/视频段与 @全体成员是否带上见上方标记；@全体 的博主名单与关键词都命中才会带上，名单可在上方「监控博主」列表点「@全体」调整。在插件配置面板改完配置后点「刷新预览」即可看到群里将收到的效果。</p>
   </section>
 
   <section class="card">

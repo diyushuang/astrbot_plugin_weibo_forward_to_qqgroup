@@ -312,6 +312,25 @@ function renderAccounts(accounts) {
     }
     li.append(el("span", "badge", `已见 ${acc.seen_count}`));
     if (acc.push_ok > 0) li.append(el("span", "badge", `已推 ${acc.push_ok}`));
+    const atBtn = el(
+      "button",
+      "btn-mini btn-at" + (acc.at_all ? " on" : ""),
+      acc.at_all ? "@全体 开" : "@全体"
+    );
+    atBtn.type = "button";
+    atBtn.title = acc.at_all
+      ? "点击取消：该博主的新微博推送不再 @全体成员"
+      : "点击开启：该博主的新微博推送时 @全体成员";
+    atBtn.addEventListener("click", () => {
+      const turningOn = !acc.at_all;
+      act(atBtn, "at-all-uids", { action: turningOn ? "add" : "remove", uid: acc.uid }, () =>
+        setStatus(
+          turningOn ? `已设为 @全体：${acc.name}` : `已取消 @全体：${acc.name}`,
+          "ok"
+        )
+      );
+    });
+    li.append(atBtn);
     const rm = el("button", "btn-mini", "移除");
     rm.type = "button";
     rm.addEventListener("click", async () => {
@@ -614,6 +633,8 @@ function renderOverview(data) {
   renderStats(data.stats || {});
   renderActivity(data.activity || []);
   els["album-disabled-tip"].hidden = !!(data.status || {}).album_enabled;
+  // 博主名单存了却不 @ 的唯一原因是总开关关着，这时才提示，平时不打扰
+  els["at-all-tip"].hidden = !(data.status || {}).at_all_uid_count || !!(data.status || {}).at_all;
 }
 
 function renderErrors(items) {
@@ -688,6 +709,10 @@ function renderPreview(data) {
   badges.append(el("span", "badge", data.with_images ? "推送带图 开" : "推送带图 关"));
   badges.append(el("span", "badge", data.with_videos ? "推送带视频 开" : "推送带视频 关"));
   const kws = data.at_all_keywords || [];
+  const uids = data.at_all_uids || [];
+  if (data.at_all_on && uids.length) {
+    badges.append(el("span", "preview-kw", `@全体博主：${uids.join("、")}（名单外的博主不 @）`));
+  }
   if (data.at_all_on && kws.length) {
     badges.append(el("span", "preview-kw", `@全体关键词：${kws.join("、")}`));
   }
