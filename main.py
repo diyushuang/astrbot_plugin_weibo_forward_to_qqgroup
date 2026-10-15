@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.10.0"
+PLUGIN_VERSION = "v1.11.0"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -2469,7 +2469,7 @@ class WeiboMonitorPlugin(Star):
             "is_retweet": False,
             "link": f"https://weibo.com/{sample_uid}/example",
         }
-        kws = [str(k).strip() for k in (self.config.get("at_all_keywords") or []) if str(k).strip()]
+        kws = self._at_all_keywords()
         return {
             "text": self._build_message(sample),
             "at_all": self._at_all_hit({"raw_text": sample_text, "uid": sample_uid}),
@@ -2892,6 +2892,15 @@ class WeiboMonitorPlugin(Star):
                 uids.append(uid)
         return uids
 
+    def _at_all_keywords(self) -> list[str]:
+        """@全体的关键词限定（去空白、保序去重）；空列表 = 不限内容。"""
+        kws: list[str] = []
+        for item in self.config.get("at_all_keywords") or []:
+            kw = str(item).strip()
+            if kw and kw not in kws:
+                kws.append(kw)
+        return kws
+
     def _at_all_hit(self, item: dict[str, Any]) -> bool:
         """这条推送是否满足 @全体条件：总开关开、博主在名单内、且关键词命中。
 
@@ -2906,7 +2915,7 @@ class WeiboMonitorPlugin(Star):
         uids = self._at_all_uids()
         if uids and str(item.get("uid") or "") not in uids:
             return False
-        kws = [str(k).strip() for k in (self.config.get("at_all_keywords") or []) if str(k).strip()]
+        kws = self._at_all_keywords()
         if not kws:
             return True
         text = str(item.get("raw_text") or "")

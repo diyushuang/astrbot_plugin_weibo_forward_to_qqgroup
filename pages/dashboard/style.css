@@ -260,6 +260,10 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 .row-form { display: flex; gap: 8px; margin-bottom: 10px; }
 
+/* 推送 @全体 卡片：总开关一行，下面接博主名单与关键词名单两个表单 */
+.at-all-switch { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.at-all-switch + .row-form { margin-top: 4px; }
+
 .list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
 
 .list li {

@@ -73,6 +73,13 @@ except ImportError:  # 旧版 Dashboard 走 Quart 原生上下文，做最小等
                 return {} if default is None else default
 
 
+# 面板手工添加 @全体 关键词时的单条长度与总数量上限。判定侧不看这些值——
+# 配置里手工写更多/更长的关键词照样生效，这里只挡面板上误把一整段微博正文
+# 当关键词粘进来的操作（那种关键词永远命中不了，却会留在配置里没人发现）。
+AT_ALL_KEYWORD_MAX_LEN = 30
+AT_ALL_KEYWORD_MAX_COUNT = 20
+
+
 def register_dashboard(
     plugin,
     plugin_name: str,
@@ -116,6 +123,12 @@ def register_dashboard(
             api.at_all_uids,
             ["POST"],
             "增删 @全体 博主名单",
+        ),
+        (
+            f"/{plugin_name}/at-all-settings",
+            api.at_all_settings,
+            ["POST"],
+            "@全体 总开关与关键词限定",
         ),
         (f"/{plugin_name}/sessions", api.sessions, ["POST"], "增删推送目标"),
         (f"/{plugin_name}/album-rules", api.album_rules, ["POST"], "增删相册规则"),
@@ -177,7 +190,22 @@ class DashboardAPI:
 
         accounts = []
         by_uid = p.stats.get("by_uid") or {}
-        at_all_uids = set(p._at_all_uids())
+        at_all_uid_list = p._at_all_uids()
+        at_all_uids = set(at_all_uid_list)
+        # @全体成员的设置项集中在一份数据里回给面板（总开关 / 博主名单 / 关键词），
+        # 状态区不再重复放一份，免得两处口径漂移
+        at_all_settings = {
+            "at_all": bool(p.config.get("at_all", False)),
+            "keywords": p._at_all_keywords(),
+            "bloggers": [
+                {
+                    "uid": uid,
+                    "name": p._account_name(uid),
+                    "monitored": uid in p.accounts,
+                }
+                for uid in at_all_uid_list
+            ],
+        }
         for uid, info in p.accounts.items():
             accounts.append(
                 {
@@ -284,9 +312,6 @@ class DashboardAPI:
                     "proxy": self._redact_proxy(p._proxy) if p._proxy else "",
                     "ffmpeg": bool(p._ffmpeg),
                     "album_enabled": bool(p.config.get("album_enabled", True)),
-                    # 博主行的 @全体 开关只在总开关打开时才真正生效，面板要能说明
-                    "at_all": bool(p.config.get("at_all", False)),
-                    "at_all_uid_count": len(at_all_uids),
                     # 在途后台任务：非零且有错误时配合错误日志定位卡在哪一步
                     "bg_tasks": {
                         "video_download": len(p._video_tasks),
@@ -299,6 +324,7 @@ class DashboardAPI:
                     "disk": p._disk_snapshot(),
                 },
                 "accounts": accounts,
+                "at_all_settings": at_all_settings,
                 "sessions": p._sessions(),
                 "album_rules": album_rules,
                 "keyword_rules": keyword_rules,
@@ -443,21 +469,23 @@ class DashboardAPI:
         return error_response("不支持的操作")
 
     async def at_all_uids(self):
+        """@全体 博主名单的增删（面板博主行开关与「推送 @全体成员」卡片共用）。"""
         p = self.p
         body = await self._body()
         action = str(body.get("action") or "")
         uid = self._extract_uid(str(body.get("uid") or "")) or ""
         if not uid:
             return error_response("请输入有效的微博 uid 或主页链接")
-        p._sync_accounts_from_config()
-        if uid not in p.accounts:
-            return error_response(f"账号 {uid} 不在监控列表中，请先添加监控")
         current = p._at_all_uids()
         if action == "add":
+            p._sync_accounts_from_config()
+            if uid not in p.accounts:
+                return error_response(f"账号 {uid} 不在监控列表中，请先添加监控")
             if uid in current:
                 return error_response(f"账号 {uid} 已在 @全体名单中")
             p.config["at_all_uids"] = [*current, uid]
         elif action == "remove":
+            # 移出不要求仍在监控列表：取消监控后留在名单里的 uid 也该能从面板清掉
             if uid not in current:
                 return error_response(f"账号 {uid} 不在 @全体名单中")
             p.config["at_all_uids"] = [u for u in current if u != uid]
@@ -473,6 +501,48 @@ class DashboardAPI:
             detail="通过面板加入 @全体名单" if on else "通过面板移出 @全体名单",
         )
         return json_response({"uid": uid, "name": name, "at_all": on})
+
+    async def at_all_settings(self):
+        """@全体成员的总开关与关键词限定（面板「推送 @全体成员」卡片）。
+
+        名单（哪些博主）在 at_all_uids 里增删，这里只动另外两道闸门：总开关
+        与关键词。判定口径由 main.py 的 _at_all_hit 负责，本接口只管写配置。
+        """
+        p = self.p
+        body = await self._body()
+        action = str(body.get("action") or "")
+        if action == "set_switch":
+            if "value" not in body:
+                return error_response("缺少 value（true 开启 / false 关闭）")
+            on = bool(body.get("value"))
+            p.config["at_all"] = on
+            p._save_config()
+            p._record_event("info", detail=f"面板{'开启' if on else '关闭'} @全体成员总开关")
+            return json_response({"at_all": on})
+        if action in ("add_keyword", "remove_keyword"):
+            kw = str(body.get("keyword") or "").strip()
+            if not kw:
+                return error_response("请输入关键词")
+            if len(kw) > AT_ALL_KEYWORD_MAX_LEN:
+                return error_response(f"单个关键词最长 {AT_ALL_KEYWORD_MAX_LEN} 字")
+            kws = p._at_all_keywords()
+            adding = action == "add_keyword"
+            if adding:
+                if kw in kws:
+                    return error_response(f"关键词「{kw}」已在限定列表中")
+                if len(kws) >= AT_ALL_KEYWORD_MAX_COUNT:
+                    return error_response(f"关键词最多 {AT_ALL_KEYWORD_MAX_COUNT} 个，先删些再添加")
+                p.config["at_all_keywords"] = [*kws, kw]
+            else:
+                if kw not in kws:
+                    return error_response(f"关键词「{kw}」不在限定列表中")
+                p.config["at_all_keywords"] = [k for k in kws if k != kw]
+            p._save_config()
+            p._record_event(
+                "info", detail=f"面板{'加入' if adding else '移除'} @全体关键词「{kw}」"
+            )
+            return json_response({"keywords": p._at_all_keywords()})
+        return error_response("不支持的操作")
 
     async def sessions(self):
         p = self.p

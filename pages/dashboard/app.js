@@ -9,6 +9,10 @@ const POLL_MS = 20000;
  * 窗口常量只在 main.py 定义一份，页面照自己的常量估算早晚会与后端对不上。 */
 let cancelUndoSeconds = 1800;
 
+/* @全体成员总开关的当前状态，由每次 overview 覆盖；卡片上的按钮按它决定这一次
+ * 是"开启"还是"关闭"，所以点击时取反发出 set_switch 就够了。 */
+let atAllOn = false;
+
 function undoMinutes() {
   return Math.max(1, Math.round(cancelUndoSeconds / 60));
 }
@@ -348,6 +352,58 @@ function renderAccounts(accounts) {
   renderListEmpty(list, els["accounts-empty"], accounts.length);
 }
 
+/* 「推送 @全体成员」卡片：总开关 + 博主名单 + 关键词名单，三道闸门都在这一张卡里改 */
+function renderAtAll(settings) {
+  const s = settings || {};
+  atAllOn = !!s.at_all;
+  els["btn-at-all-switch"].textContent = atAllOn ? "关闭 @全体" : "开启 @全体";
+  const state = els["at-all-switch-state"];
+  state.textContent = atAllOn ? "总开关：开启" : "总开关：关闭";
+  state.className = "badge" + (atAllOn ? " ok" : "");
+
+  const bloggers = s.bloggers || [];
+  els["at-all-count"].hidden = bloggers.length === 0;
+  els["at-all-count"].textContent = String(bloggers.length);
+  const uidList = els["at-uid-list"];
+  uidList.replaceChildren();
+  for (const b of bloggers) {
+    const li = el("li");
+    const main = el("div", "li-main");
+    main.append(el("span", "", b.name));
+    main.append(el("span", "li-sub", `uid ${b.uid}`));
+    li.append(main);
+    if (!b.monitored) li.append(el("span", "badge warn", "已取消监控"));
+    const rm = el("button", "btn-mini", "移除");
+    rm.type = "button";
+    rm.addEventListener("click", () =>
+      act(rm, "at-all-uids", { action: "remove", uid: b.uid }, () =>
+        setStatus(`已从 @全体名单移除：${b.name}`, "ok")
+      )
+    );
+    li.append(rm);
+    uidList.append(li);
+  }
+  renderListEmpty(uidList, els["at-uid-empty"], bloggers.length);
+
+  const keywords = s.keywords || [];
+  const kwList = els["at-kw-list"];
+  kwList.replaceChildren();
+  for (const kw of keywords) {
+    const li = el("li");
+    li.append(el("div", "li-main", kw));
+    const rm = el("button", "btn-mini", "移除");
+    rm.type = "button";
+    rm.addEventListener("click", () =>
+      act(rm, "at-all-settings", { action: "remove_keyword", keyword: kw }, () =>
+        setStatus(`已移除 @全体关键词：${kw}`, "ok")
+      )
+    );
+    li.append(rm);
+    kwList.append(li);
+  }
+  renderListEmpty(kwList, els["at-kw-empty"], keywords.length);
+}
+
 function renderSessions(sessions) {
   els["sessions-count"].textContent = String(sessions.length);
   const list = els["session-list"];
@@ -625,6 +681,7 @@ function renderOverview(data) {
   if (status.cancel_undo_seconds > 0) cancelUndoSeconds = status.cancel_undo_seconds;
   renderStatus(status);
   renderAccounts(data.accounts || []);
+  renderAtAll(data.at_all_settings);
   renderSessions(data.sessions || []);
   renderRules(data.album_rules || []);
   renderKeywordRules(data.keyword_rules || []);
@@ -634,7 +691,8 @@ function renderOverview(data) {
   renderActivity(data.activity || []);
   els["album-disabled-tip"].hidden = !!(data.status || {}).album_enabled;
   // 博主名单存了却不 @ 的唯一原因是总开关关着，这时才提示，平时不打扰
-  els["at-all-tip"].hidden = !(data.status || {}).at_all_uid_count || !!(data.status || {}).at_all;
+  const atAll = data.at_all_settings || {};
+  els["at-all-tip"].hidden = atAll.at_all || !(atAll.bloggers || []).length;
 }
 
 function renderErrors(items) {
@@ -794,6 +852,44 @@ function wireForms() {
       els["kw-rule-keyword"].value = "";
       els["kw-rule-gid"].value = "";
       els["kw-rule-album"].value = "";
+    });
+  });
+
+  els["btn-at-all-switch"].addEventListener("click", (ev) => {
+    const btn = ev.currentTarget;
+    const turnOn = !atAllOn;
+    act(btn, "at-all-settings", { action: "set_switch", value: turnOn }, () => {
+      // 名单与关键词都空着就开开关 = 每条推送都打扰全员，值得在提示里点一句
+      const noScope = els["at-all-count"].hidden && !els["at-kw-list"].children.length;
+      if (turnOn && noScope) {
+        setStatus("已开启 @全体：所有博主的每条新微博都会 @全体成员，可用博主名单或关键词收窄", "ok");
+      } else if (turnOn) {
+        setStatus("已开启 @全体总开关", "ok");
+      } else {
+        setStatus("已关闭 @全体总开关（博主名单与关键词保留）", "ok");
+      }
+    });
+  });
+
+  els["at-uid-form"].addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const input = els["at-uid-input"];
+    const uid = input.value.trim();
+    if (!uid) return;
+    act(ev.submitter, "at-all-uids", { action: "add", uid }, () => {
+      setStatus("已加入 @全体名单", "ok");
+      input.value = "";
+    });
+  });
+
+  els["at-kw-form"].addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const input = els["at-kw-input"];
+    const keyword = input.value.trim();
+    if (!keyword) return;
+    act(ev.submitter, "at-all-settings", { action: "add_keyword", keyword }, () => {
+      setStatus(`已加入 @全体关键词：${keyword}`, "ok");
+      input.value = "";
     });
   });
 
