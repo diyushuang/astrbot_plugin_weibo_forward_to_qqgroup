@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.11.0"
+PLUGIN_VERSION = "v1.12.0"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -159,7 +159,10 @@ RISK_COOLDOWN_STEPS = (600, 1800, 3600)
 RISK_ESCALATION_RESET = 2 * 3600
 
 # ---------------- 群相册自动上传 ----------------
-DEFAULT_MAX_IMAGES = 9  # 单条微博最多处理的图片数（消息带图与相册上传共用上限）
+# 单条微博最多处理的图片数（消息带图与相册上传共用上限）：微博单条上限
+# 就是 18 图（2019-09 起对邀请账号放开、后逐步扩面），默认全量处理不丢图；
+# 想少下少传（省流量/防刷屏）在配置 album_max_images 调小
+DEFAULT_MAX_IMAGES = 18
 IMG_MAX_BYTES = 30 * 1024 * 1024  # 单张图片/实况图视频段的下载体积上限
 DISK_FLOOR_MB = 1024  # 批次下载前要求临时目录所在盘至少剩余空间（MB），防写满磁盘
 ALBUM_TMP_DIR = "album_tmp"  # 相册上传的临时下载目录（插件数据目录下），传完即删
@@ -2198,8 +2201,12 @@ class WeiboMonitorPlugin(Star):
                 have.add(pid)
         post["pics"] = merged
 
-    async def _fetch_video_detail(self, pid: str) -> dict[str, Any] | None:
-        """拉 statuses/show 详情，失败或结构异常返回 None（不抛，调用方按无视频降级）。"""
+    async def _fetch_status_detail(self, pid: str, what: str = "视频") -> dict[str, Any] | None:
+        """拉 statuses/show 详情，失败或结构异常返回 None（不抛，调用方各自降级）。
+
+        视频直链与超 9 图补全共用这一个详情接口：视频路径回退「请点原帖
+        链接」提示，图片路径按时间线已识别到的图继续（见 _ensure_full_pics）。
+        """
         try:
             data = await self._api_get(
                 WEIBO_SHOW_URL,
@@ -2209,10 +2216,56 @@ class WeiboMonitorPlugin(Star):
         except asyncio.CancelledError:
             raise
         except WeiboFetchError as e:
-            logger.info(f"获取微博 {pid} 视频详情失败，推送时将提示打开原帖: {e}")
+            logger.info(f"获取微博 {pid} {what}详情失败: {e}")
             return None
         detail = data.get("data")
         return detail if isinstance(detail, dict) else None
+
+    async def _ensure_full_pics(self, post: dict[str, Any]) -> None:
+        """超 9 图微博的识别补全：时间线卡片的 pics 不齐时对照 pic_num 补拉详情。
+
+        线上出现过 18 图微博只识别到 9 张：时间线卡片的 pics 与自述的
+        pic_num 对不上（前者疑似只带部分图）。这里以 pic_total 为准绳，
+        发现缺图就补拉一次 statuses/show——详情的 pics 是完整列表（转发
+        帖挂在 retweeted_status 上）。安全边界：
+
+        - 只在图片确实会被用到（消息带图或相册上传任一开启）时才补，
+          两个开关都关着补图纯属浪费请求；
+        - 补拉失败或对不上时按时间线已识别的继续，图片补全不反过来
+          挡推送；
+        - 拉到的详情挂到 post["_show_detail"]，_apply_video 的兜底详情
+          直接复用它，同一帖不花第二次请求（条目入队时该字段被丢弃）。
+        """
+        if not (
+            bool(self.config.get("message_with_images", True))
+            or bool(self.config.get("album_enabled", True))
+        ):
+            return
+        total = int(post.get("pic_total") or 0)
+        have = post.get("pics") or []
+        if total <= len(have):
+            return
+        pid = str(post.get("id") or "")
+        if not pid:
+            return
+        detail = await self._fetch_status_detail(pid, "完整图片")
+        if detail is None:
+            return
+        post["_show_detail"] = detail
+        rt = detail.get("retweeted_status")
+        full = _extract_pics(detail, rt if isinstance(rt, dict) else None)
+        merged = list(have)
+        known = {str(p.get("pid") or "") for p in merged}
+        for p in full:
+            key = str(p.get("pid") or "")
+            if key and key not in known:
+                merged.append(p)
+                known.add(key)
+        if len(merged) > len(have):
+            logger.info(
+                f"微博 {pid} 时间线只识别到 {len(have)}/{total} 张图，详情补全为 {len(merged)} 张"
+            )
+            post["pics"] = merged
 
     async def _apply_video(self, post: dict[str, Any]) -> None:
         """提取视频直链到 post["videos"]，混排里的图片一并并入 post["pics"]。
@@ -2245,7 +2298,9 @@ class WeiboMonitorPlugin(Star):
             if _only_live_video(post.get("video_src")):
                 logger.info(f"微博 {pid} 的视频正在直播，无可下载直链，推送时提示打开原帖")
                 return
-            detail = await self._fetch_video_detail(pid)
+            # _ensure_full_pics 补图拉过的详情挂在这里，直接复用：同一帖
+            # 不为视频再花一次 2~5 秒限速的详情请求（pop 取走，只消费一次）
+            detail = post.pop("_show_detail", None) or await self._fetch_status_detail(pid)
             if detail is not None:
                 videos = self._videos_from_mblog(detail, prefer_hd, seen_urls, max_bytes)
                 consulted.append(detail)
@@ -2371,8 +2426,21 @@ class WeiboMonitorPlugin(Star):
         # pics 数组）。只用作相册上传跳过时的日志说明，是否上传始终以提取到的
         # 图片列表为准，避免未来出现"图文视频混排"时误跳过混排里的真图。
         pi = mb.get("page_info") if isinstance(mb.get("page_info"), dict) else {}
-        rt_pi = rt_mb.get("page_info") if isinstance(rt_mb, dict) else {}
+        # 原微博的 page_info 只查容器不查值会漏判 None（转发纯文字帖就撞上），
+        # 与上一行同口径：取不到就当空 dict
+        rt_pi = (
+            rt_mb.get("page_info")
+            if isinstance(rt_mb, dict) and isinstance(rt_mb.get("page_info"), dict)
+            else {}
+        )
         is_video = str(pi.get("type") or "") == "video" or str(rt_pi.get("type") or "") == "video"
+        # 接口自述的图片总数：超 9 图微博时间线卡片的 pics 只携带部分图片时，
+        # pic_num 仍是全量数——识别侧据此补一次详情拿全量，见 _ensure_full_pics。
+        # 转发帖的图挂在原微博上，两处取大即真实总数
+        pic_total = 0
+        for node in (mb, rt_mb):
+            with contextlib.suppress(TypeError, ValueError):
+                pic_total = max(pic_total, int((node or {}).get("pic_num") or 0))
 
         return {
             "id": pid,
@@ -2390,6 +2458,7 @@ class WeiboMonitorPlugin(Star):
             # 本条是否超长（全文按需拉取时用，见 _apply_full_text）
             "is_long": bool(mb.get("isLongText")),
             "pics": _extract_pics(mb, rt_mb),
+            "pic_total": pic_total,
             "is_video": is_video,
             # 卡片原始结构的引用（只在本次入队流程里用，不写进 state.json）：
             # 视频直链优先从这里取，省一次详情请求，见 _apply_video
@@ -2621,8 +2690,9 @@ class WeiboMonitorPlugin(Star):
             if len(self.pending) >= PENDING_HARD_LIMIT:
                 logger.warning("待推送队列已满，丢弃更早的新微博")
                 continue
-            # 视频详情按需拉取（每帖最多 1 次额外请求）：放在过滤之后，
-            # 被过滤掉的帖子不花这个请求
+            # 超 9 图识别补全与视频详情按需拉取：都放在过滤之后，被过滤
+            # 掉的帖子不花这些请求；补全在前，_apply_video 能复用它拉到的详情
+            await self._ensure_full_pics(post)
             await self._apply_video(post)
             videos_enabled = self._videos_enabled()
             extracted = post.get("videos") or []
@@ -3791,7 +3861,7 @@ class WeiboMonitorPlugin(Star):
         prefer_hd = str(self.config.get("video_quality") or "hd") != "sd"
         cap_mb = self._video_download_cap_mb()
         max_bytes = cap_mb * 1048576 if cap_mb > 0 else 0
-        detail = await self._fetch_video_detail(pid)
+        detail = await self._fetch_status_detail(pid)
         if detail is None:
             return []
         seen: set[str] = set()

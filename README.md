@@ -175,7 +175,7 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 | `album_enabled` | `true` | 图片自动上传群相册总开关（无绑定规则时不会有任何行为） |
 | `album_rules` | `[]` | 相册绑定规则，每条 `uid:群号:相册名或ID`（推荐用指令管理） |
 | `album_keyword_rules` | `[]` | 关键词路由规则，全局 `关键词:群号:相册名或ID`、博主 `uid:关键词:群号:相册名或ID`；命中时图片只传固定相册、博主规则优先、未配置时按默认绑定（推荐用指令管理） |
-| `album_max_images` | `9` | 单条微博最多处理的图片数（消息带图与相册上传共用） |
+| `album_max_images` | `18` | 单条微博最多处理的图片数（消息带图与相册上传共用；微博单条上限 18 图，默认全量处理，超 9 图自动补拉详情识别） |
 | `album_download_concurrency` | `5` | 相册图片下载并发数（走微博 CDN，可多路一起） |
 | `album_upload_concurrency` | `3` | 相册图片上传并发数（协议端每张内部串行发分片，并发数≈吞吐） |
 | `album_upload_interval` | `0.5` | 相邻两张图片上传的间隔（秒），防 QQ 相册频控 |
@@ -193,7 +193,7 @@ https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup
 **使用**
 
 1. 在目标群内绑定：`微博相册绑定 <uid> <相册名或ID>`（同一博主可在不同群绑不同相册）；
-2. 该博主有新微博且**成功推送到该群**后，插件自动提取微博内全部图片（含转发原微博的图）；
+2. 该博主有新微博且**成功推送到该群**后，插件自动提取微博内全部图片（含转发原微博的图）；超 9 图的微博时间线只给到部分图片，插件按接口自述的图片总数自动补拉一次详情识别全量，18 图帖不再只传一半；
 3. 下载 `/large/` 原图到临时目录 → 经 NapCat 的 OneBot 扩展接口 `upload_image_to_qun_album` 传进相册 → 传完即删临时文件；
 4. 实况图（livephoto）优先转 GIF 上传（需 ffmpeg），失败或 GIF 超 30MB 回落封面静图；纯视频微博跳过（群相册只收图片与实况图）。
 

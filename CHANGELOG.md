@@ -5,6 +5,28 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [1.12.0] - 2026-10-17
+
+线上出现一条 18 图微博只识别到 9 张、群相册也只传了 9 张。两层原因叠在一起：一是图片数上限 `album_max_images` 定在默认 9——那是按微博单条 9 图的旧经验给的默认值，微博早已放开到 18 图，超 9 图帖被默认配置静默砍半；二是时间线接口对超 9 图微博的 `pics` 数组疑似只携带部分图片，就算把上限调大，单靠时间线也可能识别不全。这一版两头都修：默认上限对齐微博单条上限 18，识别侧对照接口自述的 `pic_num` 发现缺图就补拉一次详情。
+
+### 修复
+
+- **18 图微博只识别 9 张、只上传 9 张**：
+  - **识别补全**：`_parse_post` 留存接口自述的图片总数（`pic_num`，外层与转发原微博取大）；入队前发现总数大于已提取的图就补拉一次 `statuses/show`——详情的 `pics` 是完整列表（转发帖挂在 `retweeted_status` 上），按 pid 去重并进图片列表，缺多少补多少。补拉只在图片确实会被用到（消息带图或相册上传任一开启）时进行；失败或对不上按时间线已识别的继续，图片补全不反过来挡推送。
+  - **上限默认 9 → 18**：`DEFAULT_MAX_IMAGES` 与 `album_max_images` 的默认值对齐微博单条上限，超 9 图帖默认全量处理不再丢图。**注意**：从旧版本升级的部署，配置里已存的 9 不会自动跟着变，需手动把 `album_max_images` 调到 18（或删掉该键走新默认）才会完整转发。
+- **同帖不重复花详情请求**：补拉到的详情挂在帖子结构上由 `_apply_video` 的兜底详情直接复用——视频帖原先会为取直链把同一个详情接口再拉一遍，现在最多一次；`_fetch_video_detail` 相应更名 `_fetch_status_detail`（视频直链与图片补全共用，日志注明用途）。
+- **转发纯文字帖不再可能炸解析**（回归测试中暴露的顺手修复）：`_parse_post` 对转发原微博的 `page_info` 只判了容器没判值，原文缺该字段（纯文字帖常见）时 `.get("type")` 直接 `AttributeError`——与外层微博同口径，取不到按空 dict。
+
+### 变更
+
+- 识别补全与视频详情拉取同口径：都在关键词/时效过滤之后、只对确定要推送的帖子进行，被过滤掉的帖子一个请求都不多花。
+- 带图消息的发送超时按张数放大（60s + 20s/张）对 18 图帖自动放到 420s，无需改动。
+
+### 测试
+
+- 新增 `bench/_test_v1120_full_pics.py`（**50 项**）：`pic_total` 提取（自述字段/转发取大/缺失或非法为 0/转发纯文字帖不炸）、`_ensure_full_pics` 的补全与安全边界（不缺图不请求/两个图片开关全关不请求/补拉失败与结构异常回退不抛/按 pid 去重/转发帖从原微博并入/详情挂 `_show_detail`）、`_apply_video` 复用同一份详情不再二次请求、入队链路端到端（18 图帖入队 18 张、卡片齐全不补详情、显式调小上限仍截断、被屏蔽词滤掉的帖子不花详情请求、旧默认 9 配置仍截 9 张）、18 图发送超时自动放大到 420s、配置三处同步（代码常量/schema 默认值/README 表）与版本号三处同步。
+- `_test_v181_filefirst.py` 版本号断言同步 v1.12.0；全量回归 16 个用例脚本共 **759 项**断言通过；ruff check 干净（本地 ruff 0.16.7 与早前版本的 format 排版有漂移，仅对本次新增文件按当前版本格式化，既有文件维持原排版不动）。
+
 ## [1.11.0] - 2026-10-15
 
 上一版把「哪个博主该 @」做成了博主行的开关，但 @全体 本身还剩两处只能去 AstrBot 插件配置里编辑列表：总开关、关键词限定。想改一个字要跳出面板、改的是 JSON 数组、改完还看不到效果——这一版把它们收进面板的同一张卡片。
@@ -495,6 +517,10 @@ v1.7.4 把"协议端拒收富媒体"的现场证据留了下来，这一版解�
 
 <!-- 版本对比链接（发布新版本时请同步打 git tag，并在此补一行 compare 链接） -->
 
+[1.12.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.11.0...v1.12.0
+[1.11.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.10.0...v1.11.0
+[1.10.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.9.0...v1.10.0
+[1.9.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.8.1...v1.9.0
 [1.8.1]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.6...v1.8.0
 [1.7.6]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.7.5...v1.7.6

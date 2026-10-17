@@ -159,7 +159,8 @@
   "album_max_images": {
     "description": "单条微博最多处理的图片数（消息带图与相册上传共用上限）",
     "type": "int",
-    "default": 9
+    "default": 18,
+    "hint": "微博单条上限 18 图，默认全量处理不丢图；超 9 图微博会自动多拉一次详情补全识别。从旧版本升级且配置里存的是旧默认 9 的，需手动调到 18 才会完整转发"
   },
   "album_download_concurrency": {
     "description": "相册图片下载并发数",
