@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [1.12.2] - 2026-10-19
+
+针对一条"被限制传播"的真实微博（`yellow_tip`「博文涉及营销推广正在审核中，暂时无法传播」，1 视频 + 图文混排）做真机实测：游客身份下详情接口照常返回（ok=1）、时间线可见、图片 CDN 照常可下，**限制传播本身不影响插件拉取**；但它暴露了新的缺图形态——接口把 `pic_ids` 全量给出（11 个 id），`pics` 数组却只带 9 条详情（8 纯图 + 1 视频封面），v1.12.1 的两条补全路（pic_num 主信号、9 张兜底）拉到详情后仍然缺 3 张，只能落"仍不足"warning。真机用插件下载头实测：缺失的 3 张图按 pid 构造图床地址（`/large/`、`/mw2000/`）全部可拉（473~649KB）。本版把这条路做进识别补全。
+
+### 修复
+
+- **pic_ids 权威列表兜底**：`_ensure_full_pics` 合并详情后，若 `pic_ids` 里有 id 没有对应的 pics 详情条目，直接按 pid 构造图片条目（`/large/` 原图档 + `/mw2000/` alt 兜底，host 沿用同帖已识别图的节点）并入列表。正常帖 `pic_ids` 与 pics 详情一一对应、构造 0 条零影响；受限帖实测从 8 张补全到接口自述的 11 张。`pid` 推不出真实扩展名，构造条目 ext 固定 jpg（CDN 按档位转码；GIF 原图此场景拿不到属已知取舍）。
+- 用户口径"18 图"与接口自述 `pic_num=11` 不一致：游客接口（插件数据源）自述就是 11 图 + 1 视频，构造补全后 11 张全部拿到。若客户端确实显示 18 图，那是登录态接口的口径，游客接口拿不到；插件支持配置 `custom_cookie` 以登录身份拉取。
+
+### 测试
+
+- 新增 `bench/_test_v1122_full_pics.py`（**26 项**）：`_fill_pics_from_ids` 单元（复刻受限帖 11 id / 9 详情形状、host 沿用与默认 wx1、全覆盖与 pic_ids 缺失零构造、转发帖从原微博构造、视频封面 pid 不误入）、`_ensure_full_pics` 集成（构造后补足自述数不再告警、pic_ids 也缺时维持"仍不足"warning）、入队端到端（受限帖 8→11 张）。
+- 真机重跑：受限帖专项脚本 `_test_restricted_18pics_live.py` **13/13 通过**（时间线可见、详情 ok=1、`_ensure_full_pics` 8→11 张、11/11 张下载成功共 106.3MB、生产链路入队 11 张）；18 图正常帖 `_test_18pics_live.py` 14 项复跑通过，主信号路径无回归。
+- `_test_v1121_full_pics.py` 版本断言改一致性口径；全量回归（17 个单元用例脚本 694 项 + 面板 API 140 项）共 **834 项**断言通过；ruff check 干净。
+
 ## [1.12.1] - 2026-10-19
 
 v1.12.0 的 18 图修复上线后复盘仍留了两个"要人工才会发现"的口子：一是从旧版本升级的部署里，配置文件已存的旧默认 `album_max_images: 9` 不会跟着新默认变（CHANGELOG 只能写"需手动调大"），识别补全到 18 张也会被入队切片切回 9 张；二是补全机制完全依赖时间线卡片自述的 `pic_num`，这个字段缺失/非法时超 9 图帖的缺图无从发现。这一版把两个口子都自动化掉，漏图不再依赖用户盯日志。
@@ -533,6 +548,7 @@ v1.7.4 把"协议端拒收富媒体"的现场证据留了下来，这一版解�
 
 <!-- 版本对比链接（发布新版本时请同步打 git tag，并在此补一行 compare 链接） -->
 
+[1.12.2]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.12.1...v1.12.2
 [1.12.1]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.12.0...v1.12.1
 [1.12.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/diyushuang/astrbot_plugin_weibo_forward_to_qqgroup/compare/v1.10.0...v1.11.0

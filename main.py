@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.12.1"
+PLUGIN_VERSION = "v1.12.2"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -837,6 +837,55 @@ def _extract_pics(mb: dict[str, Any], rt_mb: dict[str, Any] | None = None) -> li
                 }
             )
     return imgs
+
+
+def _fill_pics_from_ids(
+    detail: dict[str, Any],
+    rt: dict[str, Any] | None,
+    merged: list[dict[str, str]],
+    known: set[str],
+) -> int:
+    """pic_ids 权威列表兜底：id 有、pics 详情缺的 pid 按图床地址构造条目。
+
+    受限/审核中的帖（yellow_tip「审核中，暂时无法传播」）pics 数组会被
+    接口裁剪：真机实测一条帖 pic_ids 给了 11 个 id、pics 数组只带 9 条
+    详情（其中还混着 1 条视频封面）。pid 本身就是图床文件名、地址可预测，
+    图片在 CDN 上照常可访问（用插件自己的下载头实测，缺失图全部拉回），
+    所以缺详情的 pid 直接构造 /large/ 条目（alt 兜底 /mw2000/ 转码档）。
+
+    正常帖 pic_ids 与 pics 详情一一对应，本函数构造 0 条、零影响；hosts
+    沿用同帖已识别图片的节点（wx1~wx4 实测任一可用），取不到默认 wx1。
+    构造条目 ext 固定 jpg（pid 推不出真实扩展名，微博 CDN 会按请求档位
+    转码；GIF 原图此场景拿不到属已知取舍）。返回构造条数。
+    """
+    host = ""
+    for p in merged:
+        m = re.search(r"https://(wx\d)\.sinaimg\.cn/", str(p.get("url") or ""))
+        if m:
+            host = m.group(1)
+            break
+    built = 0
+    for node in (detail, rt if isinstance(rt, dict) else None):
+        ids = (node or {}).get("pic_ids")
+        if not isinstance(ids, list):
+            continue
+        for pid in ids:
+            pid = str(pid or "").strip()
+            if not pid or pid in known:
+                continue
+            merged.append(
+                {
+                    "pid": pid,
+                    "url": f"https://{host or 'wx1'}.sinaimg.cn/large/{pid}.jpg",
+                    "alt_url": f"https://{host or 'wx1'}.sinaimg.cn/mw2000/{pid}.jpg",
+                    "ext": "jpg",
+                    "kind": "pic",
+                    "video_url": "",
+                }
+            )
+            known.add(pid)
+            built += 1
+    return built
 
 
 def _pic_stem(pic: dict[str, str]) -> str:
@@ -2329,10 +2378,14 @@ class WeiboMonitorPlugin(Star):
             if key and key not in known:
                 merged.append(p)
                 known.add(key)
+        # pic_ids 权威列表兜底：受限/审核帖的 pics 数组可能比 pic_ids 少带
+        # 详情条目（真机实测 11 个 id 只给 9 条），缺的按图床地址构造补入
+        built = _fill_pics_from_ids(detail, rt if isinstance(rt, dict) else None, merged, known)
         if len(merged) > len(have):
             logger.info(
                 f"微博 {pid} 时间线只识别到 {len(have)} 张图，详情补全为 "
                 f"{len(merged)} 张" + (f"（自述 {total}）" if total else "")
+                + (f"，含 pic_ids 构造 {built} 张" if built else "")
             )
             post["pics"] = merged
         if total > len(merged):
