@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.12.0"
+PLUGIN_VERSION = "v1.12.1"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -163,6 +163,10 @@ RISK_ESCALATION_RESET = 2 * 3600
 # 就是 18 图（2019-09 起对邀请账号放开、后逐步扩面），默认全量处理不丢图；
 # 想少下少传（省流量/防刷屏）在配置 album_max_images 调小
 DEFAULT_MAX_IMAGES = 18
+# v1.11.x 及以前 DEFAULT_MAX_IMAGES 是 9：AstrBot 把当时的默认值物化进部署
+# 配置后，升级只补缺键、不改已存值，旧部署里的 9 会一直把 18 图帖切回 9 张。
+# 存量配置的一次性迁移以它为判定特征，见 _migrate_album_max_images
+OLD_ALBUM_MAX_IMAGES = 9
 IMG_MAX_BYTES = 30 * 1024 * 1024  # 单张图片/实况图视频段的下载体积上限
 DISK_FLOOR_MB = 1024  # 批次下载前要求临时目录所在盘至少剩余空间（MB），防写满磁盘
 ALBUM_TMP_DIR = "album_tmp"  # 相册上传的临时下载目录（插件数据目录下），传完即删
@@ -1257,6 +1261,9 @@ class WeiboMonitorPlugin(Star):
             "by_uid": {},  # uid -> {"name", "push_ok"}
             "daily": {},  # "YYYY-MM-DD" -> {"push_ok", "push_fail"}
         }
+        # 已执行过的一次性升级迁移标记（随 state.json 持久化）：
+        # 标记存在就不再检查，迁移动作永不与用户后续的手工配置打架
+        self._migrations: set[str] = set()
         self.activity: deque[dict[str, Any]] = deque(maxlen=ACTIVITY_MAX)
 
     # ---------------- 生命周期 ----------------
@@ -1264,6 +1271,9 @@ class WeiboMonitorPlugin(Star):
     async def initialize(self):
         self._data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self._load_state()
+        # 存量配置迁移放在 state 读取之后：迁移标记就在 state.json 里，
+        # 先读标记才能保证"迁移过就永不再动"的语义
+        self._migrate_album_max_images()
         self._sync_accounts_from_config()
         # 实况图转 GIF 依赖 ffmpeg（缺失时回落封面静图，不影响其余功能）
         self._ffmpeg = shutil.which("ffmpeg") or ""
@@ -1414,6 +1424,40 @@ class WeiboMonitorPlugin(Star):
         saver = getattr(self.config, "save_config", None)
         if callable(saver):
             saver()
+
+    def _migrate_album_max_images(self):
+        """存量配置一次性迁移：旧默认 9 → 18（v1.12.1）。
+
+        v1.11.x 及以前 album_max_images 默认 9，AstrBot 会把默认值物化进部署
+        的 config 文件；v1.12.0 把默认改到 18，但升级只补缺键、已存的 9 不会
+        跟着变，18 图帖照旧被 `[:max_imgs]` 切回 9 张（线上复现过"识别 18、
+        上传 9"）。这里只在「存量值恰好等于旧默认 9 且从未迁移过」时上调一次：
+
+        - 判定特征是"恰好等于旧默认"：用户真改过的值（5/12/…）一眼可见，
+          绝不碰；
+        - 标记落 state.json，迁移过后用户再手动设 9 属于明确意图，尊重之，
+          此后任何启动都不再自动改动；
+        - 上调同时写回 config（_save_config）并打 warning（错误留存/面板可
+          查），用户能知道配置被动过、想去哪改回。
+        """
+        if "album_max_images_v18" in self._migrations:
+            return
+        try:
+            cur = int(self.config.get("album_max_images", DEFAULT_MAX_IMAGES))
+        except (TypeError, ValueError):
+            cur = DEFAULT_MAX_IMAGES
+        # 标记先行：本次无论是否上调，此后都不再检查第二次
+        self._migrations.add("album_max_images_v18")
+        if cur != OLD_ALBUM_MAX_IMAGES:
+            return
+        self.config["album_max_images"] = DEFAULT_MAX_IMAGES
+        self._save_config()
+        logger.warning(
+            f"{PLUGIN_NAME} 检测到 album_max_images 仍为旧版本默认值 "
+            f"{OLD_ALBUM_MAX_IMAGES}（超 9 图微博会被截回 9 张），"
+            f"已一次性自动上调为 {DEFAULT_MAX_IMAGES}（微博单条图片上限）；"
+            "如确实需要限制单条张数，请在插件配置里改回，之后不会再自动调整"
+        )
 
     def _sessions(self) -> list[str]:
         return [str(s) for s in (self.config.get("push_sessions") or [])]
@@ -1609,6 +1653,10 @@ class WeiboMonitorPlugin(Star):
                 f"重启/重载前正在推送微博 {item.get('post_id')}，发送结果未知，"
                 "为防重复未重发；如群里没收到请点原帖链接",
             )
+        # 一次性升级迁移标记（旧文件没有该键时保持空集，迁移逻辑自行兜底）
+        migs = state.get("migrations")
+        if isinstance(migs, list):
+            self._migrations = {str(m) for m in migs if isinstance(m, str)}
         self._prune_stats()
 
     def _save_state(self):
@@ -1637,6 +1685,8 @@ class WeiboMonitorPlugin(Star):
             },
             "stats": self.stats,
             "activity": list(self.activity),
+            # 一次性升级迁移标记：重启/重载后据此不再重复迁移
+            "migrations": sorted(self._migrations),
         }
         try:
             # 先写临时文件再原子替换：进程恰好死在写入中途不会留下截断的
@@ -2222,17 +2272,27 @@ class WeiboMonitorPlugin(Star):
         return detail if isinstance(detail, dict) else None
 
     async def _ensure_full_pics(self, post: dict[str, Any]) -> None:
-        """超 9 图微博的识别补全：时间线卡片的 pics 不齐时对照 pic_num 补拉详情。
+        """超 9 图微博的识别补全：时间线卡片的 pics 不齐时补拉详情核对。
 
-        线上出现过 18 图微博只识别到 9 张：时间线卡片的 pics 与自述的
-        pic_num 对不上（前者疑似只带部分图）。这里以 pic_total 为准绳，
-        发现缺图就补拉一次 statuses/show——详情的 pics 是完整列表（转发
-        帖挂在 retweeted_status 上）。安全边界：
+        线上出现过 18 图微博只识别到 9 张：时间线卡片对超 9 图帖的 pics
+        只带部分图片（真机实测见过 9/18 与 0/18 两种形态），全量数要靠
+        卡片自述的 pic_num。缺图判定走两条路：
+
+        - 主信号：pic_num > 已识别数——字段在且可信时最准（转发帖的图挂
+          在原微博上，_parse_post 已对两处取大）；
+        - 兜底：pic_num 缺失/非法（pic_total=0）但恰好识别到 9 张——9 张
+          正是卡片截断的形态，补一次详情核对。真九宫格（pic_num=9 与张数
+          一致）走主信号就返回，不花这次请求；代价只是 pic_num 缺失的
+          九宫格帖多一次详情请求，换"任何数量都不漏识别"。
+
+        补到的是 statuses/show 详情的完整 pics（转发帖挂在 retweeted_status
+        上）。安全边界：
 
         - 只在图片确实会被用到（消息带图或相册上传任一开启）时才补，
           两个开关都关着补图纯属浪费请求；
-        - 补拉失败或对不上时按时间线已识别的继续，图片补全不反过来
-          挡推送；
+        - 补拉失败、补全后仍不足自述数：warning 进错误留存（面板可查，
+          线上"只传 9 张"这类漏图不再只能靠人对日志才发现），推送按已
+          识别的继续，图片补全不反过来挡推送；
         - 拉到的详情挂到 post["_show_detail"]，_apply_video 的兜底详情
           直接复用它，同一帖不花第二次请求（条目入队时该字段被丢弃）。
         """
@@ -2243,13 +2303,21 @@ class WeiboMonitorPlugin(Star):
             return
         total = int(post.get("pic_total") or 0)
         have = post.get("pics") or []
-        if total <= len(have):
+        # pic_num 不可知时按"卡片只带前 9 张"的截断形态兜底核对一次
+        need = total > len(have) if total > 0 else len(have) == 9
+        if not need:
             return
         pid = str(post.get("id") or "")
         if not pid:
             return
         detail = await self._fetch_status_detail(pid, "完整图片")
         if detail is None:
+            logger.warning(
+                f"微博 {pid} 图片识别可能不全：已识别 {len(have)} 张"
+                + (f"（接口自述 {total} 张）" if total else "")
+                + "，补拉详情失败，按已识别的继续转发；"
+                "如群相册缺图请点原帖核对，下轮重推也会带上已识别的图"
+            )
             return
         post["_show_detail"] = detail
         rt = detail.get("retweeted_status")
@@ -2263,9 +2331,18 @@ class WeiboMonitorPlugin(Star):
                 known.add(key)
         if len(merged) > len(have):
             logger.info(
-                f"微博 {pid} 时间线只识别到 {len(have)}/{total} 张图，详情补全为 {len(merged)} 张"
+                f"微博 {pid} 时间线只识别到 {len(have)} 张图，详情补全为 "
+                f"{len(merged)} 张" + (f"（自述 {total}）" if total else "")
             )
             post["pics"] = merged
+        if total > len(merged):
+            # 补全后仍不足自述总数（详情接口也没带全）：漏图风险显性化，
+            # 与补全成功的信息分开报，两者可同时出现（并进了一部分但没补满）
+            logger.warning(
+                f"微博 {pid} 图片识别仍不足：接口自述 {total} 张，"
+                f"现在只有 {len(merged)} 张（详情接口也没带全），"
+                "可能漏图，建议点原帖核对"
+            )
 
     async def _apply_video(self, post: dict[str, Any]) -> None:
         """提取视频直链到 post["videos"]，混排里的图片一并并入 post["pics"]。
