@@ -57,7 +57,7 @@ from .napcat_album import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_weibo_forward_to_qqgroup"
-PLUGIN_VERSION = "v1.12.2"
+PLUGIN_VERSION = "v1.13.0"
 
 
 def _plugin_log_target(plugin: Any = None) -> logging.Logger:
@@ -264,6 +264,25 @@ STATS_DAILY_KEEP = 14  # 按天推送统计桶保留天数
 PUSH_CANCEL_UNDO_SECONDS = 1800.0  # 取消后可撤销窗口（秒）
 # 保留区最多留几条：窗口内取消很多条时防 state.json 无上限膨胀，超出只淘汰最旧的
 PUSH_CANCEL_KEEP = 20
+
+# ---------------- @全体成员的生效条件（权限 / 频次 / 回读确认） ----------------
+# QQ 群的 @全体 不是"发了就算"：发送者必须是群主或管理员，且账号级有频次上限
+# （据 QQ 会员说明：非超级会员的管理员 10 次/天、超级会员 20 次/天，**所有群共享**）。
+# 条件不满足时 QQ 往往不报错，而是把 at 段降级成一条纯文本 "@全体成员"——群里
+# 看着像 @ 了，实际谁都收不到提醒，插件这边却记成"推送成功"。所以链首插 AtAll
+# 之前先过一道闸门（_at_all_gate），发出去之后再回读确认（_verify_at_all）。
+AT_ALL_QUOTA_DEFAULT = 10  # 24 小时内 @全体 次数上限的默认值（0 = 不限制）
+AT_ALL_QUOTA_WINDOW = 86400.0  # 频次窗口（秒）：按 24 小时滚动计，比"自然日"保守
+AT_ALL_QUOTA_MAX_KEEP = 200  # 频次台账最多留多少个时间戳，防 state.json 膨胀
+AT_ALL_ROLE_TTL = 600.0  # 机器人群角色的缓存时长（秒）：角色极少变，不必每条推送都查
+AT_ALL_VERIFY_TRIES = 2  # 回读确认的尝试次数（协议端落库有秒级延迟）
+AT_ALL_VERIFY_GAP = 0.8  # 两次回读之间的间隔（秒）
+AT_ALL_VERIFY_COUNT = 5  # 回读时拉最近几条群消息（要能覆盖多个群同时推送）
+AT_ALL_NOTICE_TTL = 1800.0  # 同一条"没 @ 的原因"多久内不重复记日志/动态（防刷屏）
+# 权限/回读这类"为了确认一件事"的接口调用必须有上限：aiocqhttp 的 API 超时默认
+# 180 秒，协议端一旦卡住，一次查角色就能把整轮推送拖住三分钟——比不发 @全体 糟得多
+AT_ALL_API_TIMEOUT = 8.0
+AT_ALL_ROLE_NAMES = {"owner": "群主", "admin": "管理员", "member": "普通成员"}
 
 _MONTH_MAP = {
     "Jan": 1,
@@ -1314,6 +1333,17 @@ class WeiboMonitorPlugin(Star):
         # 标记存在就不再检查，迁移动作永不与用户后续的手工配置打架
         self._migrations: set[str] = set()
         self.activity: deque[dict[str, Any]] = deque(maxlen=ACTIVITY_MAX)
+        # ---- @全体成员 的生效条件（权限 / 频次 / 回读确认）----
+        # 机器人在各群的角色缓存："platform_id:群号" -> (时间戳, owner/admin/member)
+        self._at_all_roles: dict[str, tuple[float, str]] = {}
+        # 24 小时频次台账：QQ 的 @全体 次数按账号算、所有群共享，随 state.json 落盘
+        # （不落盘的话一次重载就能把已经用掉的次数洗掉，接着发就是继续被降级）
+        self._at_all_sent: list[float] = []
+        # 最近一次 @全体 的实际结果（面板「推送 @全体成员」卡片底部展示）
+        self._at_all_last: dict[str, Any] = {}
+        # 同一会话同一条原因的记录时间戳：投递失败/权限不足会连续命中，不做去重
+        # 就是每轮推送往日志和动态里各刷一条
+        self._at_all_notices: dict[str, float] = {}
 
     # ---------------- 生命周期 ----------------
 
@@ -1706,6 +1736,21 @@ class WeiboMonitorPlugin(Star):
         migs = state.get("migrations")
         if isinstance(migs, list):
             self._migrations = {str(m) for m in migs if isinstance(m, str)}
+        # @全体 的 24 小时频次台账与上次投递结果（旧文件没有这两个键时保持默认）
+        sent = state.get("at_all_sent")
+        if isinstance(sent, list):
+            self._at_all_sent = [
+                float(ts) for ts in sent if isinstance(ts, (int, float))
+            ][-AT_ALL_QUOTA_MAX_KEEP:]
+        last = state.get("at_all_last")
+        if isinstance(last, dict) and last:
+            self._at_all_last = {
+                "ts": float(last.get("ts") or 0),
+                "session": str(last.get("session") or ""),
+                "state": str(last.get("state") or ""),
+                "detail": str(last.get("detail") or ""),
+            }
+        self._at_all_quota_used()  # 顺带清掉已过窗口的时间戳
         self._prune_stats()
 
     def _save_state(self):
@@ -1734,6 +1779,10 @@ class WeiboMonitorPlugin(Star):
             },
             "stats": self.stats,
             "activity": list(self.activity),
+            # @全体 的频次台账（账号级、所有群共享）与最近一次投递结果：重载后
+            # 接着算次数，面板也能看到上次到底生效没有
+            "at_all_sent": self._at_all_sent[-AT_ALL_QUOTA_MAX_KEEP:],
+            "at_all_last": self._at_all_last,
             # 一次性升级迁移标记：重启/重载后据此不再重复迁移
             "migrations": sorted(self._migrations),
         }
@@ -3133,6 +3182,263 @@ class WeiboMonitorPlugin(Star):
             return chain
         return MessageChain(chain=[AtAll(), *chain.chain])
 
+    # ---------------- @全体成员的生效条件 ----------------
+    #
+    # 配置命中只说明"想 @",能不能真的 @ 到是另一件事：QQ 要求发送者是群主或
+    # 管理员，且账号级有 24 小时频次上限（普通管理员 10 次、超级会员 20 次，所有
+    # 群共享）。不满足时 QQ 常常既不报错也不拒绝，而是把 at 段降级成一条纯文本
+    # "@全体成员"——群里看着像 @ 了，实际没有任何提醒。v1.13.0 起发送前先过闸门
+    # （_at_all_gate），不满足就不带 at 段并把原因写进面板与错误留存；满足则发送，
+    # 发完回读群里那条消息确认 at 段真的落地（_verify_at_all）。
+
+    def _at_all_limit(self) -> int:
+        """24 小时内最多 @ 全体几次（0 = 不限制）。"""
+        return max(0, self._int_cfg("at_all_daily_limit", AT_ALL_QUOTA_DEFAULT))
+
+    def _at_all_quota_used(self) -> int:
+        """窗口内已经用掉的次数（顺带把过窗的时间戳丢掉）。"""
+        now = time.time()
+        self._at_all_sent = [
+            ts for ts in self._at_all_sent if now - ts < AT_ALL_QUOTA_WINDOW
+        ][-AT_ALL_QUOTA_MAX_KEEP:]
+        return len(self._at_all_sent)
+
+    def _at_all_mark_sent(self):
+        """记账一次真正带 @全体 出群的推送（与 QQ 同口径：账号级、所有群共享）。"""
+        self._at_all_sent.append(time.time())
+        self._at_all_quota_used()
+        self._save_state()
+
+    async def _bot_self_id(self, bot) -> str:
+        """AstrBot 这条连接上的登录账号 QQ 号（按 bot 实例缓存，拿不到返回空串）。"""
+        self_id = self._self_ids.get(id(bot))
+        if self_id is not None:
+            return self_id
+        try:
+            info = await asyncio.wait_for(
+                bot.call_action("get_login_info"), timeout=AT_ALL_API_TIMEOUT
+            )
+            self_id = str((info or {}).get("user_id") or "")
+        except Exception as e:
+            # 拿不到 self_id 只影响 @全体 的权限预检与相册的同机判定，不影响发送
+            logger.info(f"{PLUGIN_NAME} 获取机器人登录信息失败: {e!r}")
+            self_id = ""
+        self._self_ids[id(bot)] = self_id
+        return self_id
+
+    async def _group_role(self, platform_id: str, gid: str) -> str:
+        """机器人在这个群的角色：owner / admin / member；拿不到返回空串（未知）。
+
+        两级查询：get_group_member_info 直查自己（便宜、精确）；协议端不认这个
+        接口或回执里没有 role 时退到 get_group_member_list 自己翻。**成员列表
+        为空 / 接口异常一律按"未知"返回**，绝不能当成"没有权限"——那会把本该
+        正常的 @全体 直接关掉。结果按 AT_ALL_ROLE_TTL 缓存：角色一周也难得变一次，
+        每条推送都查一遍纯属浪费一次往返。
+        """
+        key = f"{platform_id}:{gid}"
+        now = time.time()
+        cached = self._at_all_roles.get(key)
+        if cached and now - cached[0] < AT_ALL_ROLE_TTL:
+            return cached[1]
+        if not str(gid).isdigit():
+            return ""
+        bot = self._find_bot(platform_id)
+        if bot is None:
+            return ""
+        self_id = await self._bot_self_id(bot)
+        if not self_id:
+            return ""
+        role = ""
+        try:
+            info = await asyncio.wait_for(
+                bot.call_action(
+                    "get_group_member_info", group_id=int(gid), user_id=int(self_id)
+                ),
+                timeout=AT_ALL_API_TIMEOUT,
+            )
+            if isinstance(info, dict):
+                role = str(info.get("role") or "")
+        except Exception as e:
+            logger.info(
+                f"{PLUGIN_NAME} 查询机器人在群 {gid} 的角色失败，改查成员列表: {e!r}"
+            )
+        if not role:
+            members = None
+            try:
+                members = await asyncio.wait_for(
+                    bot.call_action("get_group_member_list", group_id=int(gid)),
+                    timeout=AT_ALL_API_TIMEOUT,
+                )
+            except Exception as e:
+                logger.info(
+                    f"{PLUGIN_NAME} 获取群 {gid} 成员列表失败，@全体 权限按未知处理: {e!r}"
+                )
+            for member in members or []:
+                if isinstance(member, dict) and str(member.get("user_id") or "") == self_id:
+                    role = str(member.get("role") or "")
+                    break
+        role = role.lower()
+        if role in AT_ALL_ROLE_NAMES:
+            self._at_all_roles[key] = (now, role)
+            return role
+        return ""
+
+    async def _at_all_gate(self, session: str) -> tuple[bool, str]:
+        """此刻这条会话能不能真的 @ 到全体：返回 (可以, 不可以的原因)。"""
+        platform_id, mtype, gid = self._parse_umo(session)
+        if mtype != "GroupMessage":
+            return False, "私聊会话不带 @全体"
+        limit = self._at_all_limit()
+        if limit:
+            used = self._at_all_quota_used()
+            if used >= limit:
+                return False, (
+                    f"24 小时内已 @全体 {used} 次，达到上限 {limit} 次"
+                    "（QQ 的次数按账号算、所有群共享）；"
+                    "超级会员可把 at_all_daily_limit 调到 20，设 0 则不限制"
+                )
+        if not bool(self.config.get("at_all_check_permission", True)):
+            return True, ""
+        role = await self._group_role(platform_id, gid)
+        if not role:
+            # 拿不到角色（协议端没有成员接口、群号异常、成员列表为空）：放行。
+            # 拦错了等于功能直接失效；放过去最多是协议端自己把这条发失败，
+            # 与 v1.12.x 的行为一致，且失败后还有"去掉 @全体 补发正文"兜底
+            return True, ""
+        if role in ("owner", "admin"):
+            return True, ""
+        name = AT_ALL_ROLE_NAMES.get(role, role)
+        return False, (
+            f"机器人在本群是{name}，QQ 只允许群主/管理员 @全体；"
+            "继续发只会得到一条纯文本「@全体成员」而没有任何提醒，已改为普通推送"
+        )
+
+    def _remember_at_all(self, state: str, detail: str, session: str = ""):
+        """把 @全体 的实际结果落成面板可读的一句话（不写日志、不去重）。"""
+        self._at_all_last = {
+            "ts": time.time(),
+            "session": session,
+            "state": state,
+            "detail": detail,
+        }
+        self._record_event("at_all", detail=(f"{session}：{detail}" if session else detail))
+
+    def _note_at_all(self, state: str, detail: str, session: str = "", *, log: bool | None = None):
+        """记一次 @全体 的结果；同一条原因 AT_ALL_NOTICE_TTL 内不重复记（防刷屏）。
+
+        state 取值：ok（回读确认带上了）/ degraded（协议端把 at 降级成文本）/
+        skipped（闸门没过，没发）/ failed（协议端直接拒收）/ unknown（回读不出结论）/
+        sent（发出去了但没开回读确认，只能记个"已发出"）。
+        每条推送都命中同一原因时，只留第一条——但 _at_all_last 每次都更新，
+        面板看到的永远是最近一次的真实结果。
+        """
+        key = f"{session}|{state}|{detail}"
+        now = time.time()
+        if now - self._at_all_notices.get(key, 0.0) < AT_ALL_NOTICE_TTL:
+            return
+        self._at_all_notices[key] = now
+        self._remember_at_all(state, detail, session)
+        if log is None:
+            # 只有"确实没 @ 成"才算告警：ok 是期望结果，unknown 是回读不出结论
+            # （协议端没历史接口），都不该在错误留存里堆成问题
+            log = state in ("degraded", "failed", "skipped")
+        if log:
+            logger.warning(f"{PLUGIN_NAME} {detail}" + (f"（{session}）" if session else ""))
+        else:
+            logger.info(f"{PLUGIN_NAME} {detail}" + (f"（{session}）" if session else ""))
+
+    @staticmethod
+    def _msg_text(msg: dict[str, Any]) -> str:
+        """群消息里的纯文本部分（回读时按正文认领自己刚发的那条）。"""
+        segs = msg.get("message")
+        if isinstance(segs, str):
+            return segs
+        parts = [
+            str((seg.get("data") or {}).get("text") or "")
+            for seg in segs or []
+            if isinstance(seg, dict) and seg.get("type") == "text"
+        ]
+        return "".join(parts) or str(msg.get("raw_message") or "")
+
+    @staticmethod
+    def _msg_has_at_all(msg: dict[str, Any]) -> bool:
+        """这条群消息里是否真的带 at 全体（CQ 码形态也认）。"""
+        segs = msg.get("message")
+        if isinstance(segs, str):
+            return "qq=all" in segs.replace(" ", "")
+        for seg in segs or []:
+            if not isinstance(seg, dict) or seg.get("type") != "at":
+                continue
+            if str((seg.get("data") or {}).get("qq") or "").lower() == "all":
+                return True
+        return False
+
+    async def _verify_at_all(self, session: str, item: dict[str, Any]) -> tuple[str, str]:
+        """回读群消息，确认 at 段是不是真的落地了（返回 (state, 人话说明)）。
+
+        判定只看"自己刚发的那条"：按正文前缀在群历史里认领，认领到了再看它的
+        消息段里还有没有 at 全体——有 = ok，没有 = degraded（QQ 把 at 降级成
+        文本，正是"群里只看到 @全体成员 字样却没人被提醒"的现场）。认领不到
+        （协议端没有历史接口、落库延迟）返回 unknown：回读是诊断手段，不能反过来
+        把一条已经送出去的推送判成失败。
+        """
+        platform_id, _mtype, gid = self._parse_umo(session)
+        if not str(gid).isdigit():
+            return "unknown", "会话里没有群号，无法回读确认"
+        bot = self._find_bot(platform_id)
+        if bot is None:
+            return "unknown", "拿不到协议端连接，无法回读确认"
+        self_id = await self._bot_self_id(bot)
+        if not self_id:
+            return "unknown", "拿不到机器人账号，无法回读确认"
+        needle = str(item.get("text") or "")[:24].strip()
+        for attempt in range(AT_ALL_VERIFY_TRIES):
+            if attempt:
+                await asyncio.sleep(AT_ALL_VERIFY_GAP)
+            try:
+                resp = await asyncio.wait_for(
+                    bot.call_action(
+                        "get_group_msg_history",
+                        group_id=int(gid),
+                        count=AT_ALL_VERIFY_COUNT,
+                    ),
+                    timeout=AT_ALL_API_TIMEOUT,
+                )
+            except Exception as e:
+                logger.info(f"{PLUGIN_NAME} 回读群 {gid} 消息失败（不影响推送）: {e!r}")
+                return "unknown", "协议端不支持回读群消息，@全体 是否生效未确认"
+            msgs = resp.get("messages") if isinstance(resp, dict) else resp
+            if not isinstance(msgs, list) or not msgs:
+                continue
+            hit = None
+            for msg in reversed(msgs):
+                if not isinstance(msg, dict):
+                    continue
+                if str((msg.get("sender") or {}).get("user_id") or "") != self_id:
+                    continue
+                if needle and needle not in self._msg_text(msg):
+                    continue
+                hit = msg
+                break
+            if hit is None:
+                continue
+            if self._msg_has_at_all(hit):
+                return "ok", "回读确认群里那条消息带 @全体成员"
+            return "degraded", (
+                "回读发现 @全体 被协议端降级成了纯文本（群友不会收到提醒）："
+                "多半是机器人不是群主/管理员，或本账号 24 小时的 @全体 次数已用完"
+            )
+        return "unknown", "回读没认领到刚发出的那条消息，@全体 是否生效未确认"
+
+    async def _confirm_at_all(self, session: str, item: dict[str, Any]):
+        """发送成功后确认 @全体 是否真的生效（at_all_verify 关闭时只记一笔发出）。"""
+        if not bool(self.config.get("at_all_verify", True)):
+            self._note_at_all("sent", "已带 @全体 发出（未开启回读确认）", session, log=False)
+            return
+        state, detail = await self._verify_at_all(session, item)
+        item["at_all_state"] = state
+        self._note_at_all(state, detail, session, log=(state != "ok"))
+
     async def _send_rich_media(
         self,
         session: str,
@@ -3148,13 +3454,27 @@ class WeiboMonitorPlugin(Star):
         复用，本轮后续会话不必再拿同一条注定被拒的链各撞一次。
         @全体成员在发送环节按会话包装进链首（_with_at_all）：群聊且满足条件才带，
         发送失败时去掉 @全体补发一次正文，不让机器人权限这类问题拖死整条推送。
+        带 at 段之前先过 _at_all_gate（群主/管理员 + 24 小时频次），没过就不带，
+        并在面板与日志里写明原因——QQ 对无权限的 at 段不会报错，只会把它降级成
+        纯文本 "@全体成员"，那正是"发了却没有提醒"的现场；发出去之后再用
+        _confirm_at_all 回读群消息，把"到底生效没有"落成一句话。
         """
         at_all_skipped = False
+        at_all_allowed = False
+        # 配置命中只说明"想 @";真能不能 @ 到全体由闸门判定（权限 + 频次），
+        # 没过就不带 at 段——发出去也只会被 QQ 降级成一条纯文本 "@全体成员"。
+        # 私聊会话根本不进闸门、也不记账：@全体 只对群聊有意义，把它记成
+        # "skipped（未发送）"会让面板的"上次结果"被一条与群无关的推送刷掉，
+        # 日志里还会每半小时冒一条并不存在的故障
+        if self._at_all_hit(item) and self._parse_umo(session)[1] == "GroupMessage":
+            at_all_allowed, why = await self._at_all_gate(session)
+            if not at_all_allowed:
+                self._note_at_all("skipped", why, session)
         while True:
             send_chain = chain
             at_all_wrapped = False
             try:
-                if not at_all_skipped:
+                if not at_all_skipped and at_all_allowed:
                     wrapped = self._with_at_all(session, item, chain)
                     if wrapped is not chain:
                         send_chain = wrapped
@@ -3163,6 +3483,20 @@ class WeiboMonitorPlugin(Star):
                     session, send_chain, timeout_seconds=timeout_seconds
                 )
                 if ok:
+                    if at_all_wrapped:
+                        # 真带出门了才占频次；随后回读确认 at 段有没有被降级。
+                        # 这两步都是纯诊断：任何异常都不能漏到下面的 except 里——
+                        # 那会被当成"发送失败"，去掉 @ 段再发一次，群里就重复了
+                        try:
+                            self._at_all_mark_sent()
+                            await self._confirm_at_all(session, item)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.info(
+                                f"{PLUGIN_NAME} 确认 @全体 投递结果出错"
+                                f"（不影响已送达的推送）: {e!r}"
+                            )
                     return "sent", chain
                 return "failed", chain
             except asyncio.CancelledError:
@@ -3181,6 +3515,13 @@ class WeiboMonitorPlugin(Star):
                         logger.warning(
                             f"推送到 {session} 失败: {e!r}；@全体成员未送出，"
                             f"去掉 @全体补发微博 {item['post_id']} 的正文"
+                        )
+                        self._note_at_all(
+                            "failed",
+                            f"@全体 被协议端拒收（{self._reject_digest(e)}），"
+                            f"已去掉 @全体补发微博 {item['post_id']} 的正文",
+                            session,
+                            log=False,
                         )
                         continue
                     logger.warning(f"推送到 {session} 失败: {e!r}")
@@ -4354,16 +4695,7 @@ class WeiboMonitorPlugin(Star):
             raise NapCatError(
                 f"未找到平台 {platform_id or '(未知)'} 的 aiocqhttp 连接，无法上传群相册"
             )
-        self_id = self._self_ids.get(id(bot))
-        if self_id is None:
-            try:
-                info = await bot.call_action("get_login_info")
-                self_id = str((info or {}).get("user_id") or "")
-            except Exception as e:
-                # 拿不到 self_id 不影响上传（多号同连一个协议端时才需要）
-                logger.info(f"{PLUGIN_NAME} 获取机器人登录信息失败（不影响上传）: {e!r}")
-                self_id = ""
-            self._self_ids[id(bot)] = self_id
+        self_id = await self._bot_self_id(bot)
 
         async def caller(action: str, params: dict):
             if self_id:

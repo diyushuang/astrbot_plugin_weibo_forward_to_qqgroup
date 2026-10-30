@@ -32,6 +32,7 @@ const KIND_LABEL = {
   video_fail: "视频未转发",
   risk: "风控冷却",
   error: "检查异常",
+  at_all: "@全体成员",
   info: "事件",
 };
 
@@ -352,6 +353,33 @@ function renderAccounts(accounts) {
   renderListEmpty(list, els["accounts-empty"], accounts.length);
 }
 
+/* @全体「上一次到底生效没有」的措辞：QQ 对无权限/超次数的 at 段不会报错，
+   只会把它降级成一条纯文本，所以面板必须说清是"已确认落地"还是"被降级" */
+const AT_ALL_STATE_LABEL = {
+  ok: "已确认落地",
+  degraded: "被降级为纯文本",
+  skipped: "未发送",
+  failed: "发送失败",
+  sent: "已发出",
+  unknown: "未确认",
+};
+
+function renderAtAllLast(s) {
+  const node = els["at-all-last"];
+  if (!node) return;
+  const limit = Number(s.quota_limit || 0);
+  const used = Number(s.quota_used || 0);
+  const quota = limit ? `24 小时内已用 ${used}/${limit} 次（所有群共享）` : `24 小时内已用 ${used} 次（未设上限）`;
+  const last = s.last || {};
+  const parts = [quota];
+  if (last.detail) {
+    const label = AT_ALL_STATE_LABEL[last.state] || last.state || "事件";
+    parts.push(`上次 ${last.state === "ok" ? "✅" : "⚠️"} ${label}（${fmtTime(last.ts)}）：${last.detail}`);
+  }
+  node.textContent = parts.join(" · ");
+  node.hidden = false;
+}
+
 /* 「推送 @全体成员」卡片：总开关 + 博主名单 + 关键词名单，三道闸门都在这一张卡里改 */
 function renderAtAll(settings) {
   const s = settings || {};
@@ -360,6 +388,7 @@ function renderAtAll(settings) {
   const state = els["at-all-switch-state"];
   state.textContent = atAllOn ? "总开关：开启" : "总开关：关闭";
   state.className = "badge" + (atAllOn ? " ok" : "");
+  renderAtAllLast(s);
 
   const bloggers = s.bloggers || [];
   els["at-all-count"].hidden = bloggers.length === 0;

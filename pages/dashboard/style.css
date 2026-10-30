@@ -443,6 +443,7 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .act-dot.album_fail { background: var(--err); }
 .act-dot.risk { background: var(--warn); }
 .act-dot.error { background: var(--err); }
+.act-dot.at_all { background: var(--accent); }
 .act-dot.info { background: var(--text-dim); }
 
 .act-body { flex: 1; min-width: 0; }
@@ -452,6 +453,7 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .act-kind.push_fail, .act-kind.error, .act-kind.album_fail, .act-kind.video_fail { color: var(--err); }
 .act-kind.risk { color: var(--warn); }
 .act-kind.album { color: var(--accent); }
+.act-kind.at_all { color: var(--accent); }
 .act-name { font-weight: 600; }
 .act-detail { color: var(--text-dim); }
 .act-text { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }

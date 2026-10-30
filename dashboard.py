@@ -197,6 +197,12 @@ class DashboardAPI:
         at_all_settings = {
             "at_all": bool(p.config.get("at_all", False)),
             "keywords": p._at_all_keywords(),
+            # 「能不能真的 @ 到」的两道硬条件也一并回给面板：QQ 的 24 小时次数
+            # 台账与最近一次的投递结果（ok / degraded / skipped / failed /
+            # unknown），面板据此显示"上次 @全体 到底生效没有"
+            "quota_used": p._at_all_quota_used(),
+            "quota_limit": p._at_all_limit(),
+            "last": dict(p._at_all_last or {}),
             "bloggers": [
                 {
                     "uid": uid,

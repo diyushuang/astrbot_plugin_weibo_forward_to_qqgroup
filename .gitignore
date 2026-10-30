@@ -15,6 +15,8 @@ bench/
 .playwright-mcp/
 _test_data/
 .workbuddy/
+# bench 脚本用 AstrBot 桩加载插件时会在仓库根生成 data/（与插件运行无关）
+data/
 
 # 破坏性操作（历史重写等）前的整仓备份 bundle，不随仓库分发
 backup/
